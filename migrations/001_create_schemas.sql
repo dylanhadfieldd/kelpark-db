@@ -52,19 +52,19 @@ CREATE SCHEMA IF NOT EXISTS kara_public;
 -- ============================================================
 
 -- Farmers & breeders
-CREATE SCHEMA IF NOT EXISTS kara_farmbreed;
+CREATE SCHEMA IF NOT EXISTS farmbreed;
 
 -- Restoration practitioners
-CREATE SCHEMA IF NOT EXISTS kara_restoration;
+CREATE SCHEMA IF NOT EXISTS restoration;
 
 -- Non-genetic research (phenotypic / environmental only)
-CREATE SCHEMA IF NOT EXISTS kara_nongenresearch;
+CREATE SCHEMA IF NOT EXISTS nongenresearch;
 
 -- Genetic research (restricted access)
-CREATE SCHEMA IF NOT EXISTS kara_genresearch;
+CREATE SCHEMA IF NOT EXISTS genresearch;
 
 -- Public-facing structured search views
-CREATE SCHEMA IF NOT EXISTS kara_public_structured;
+CREATE SCHEMA IF NOT EXISTS public_structured;
 
 -- ============================================================
 -- Optional / Future System Schemas
