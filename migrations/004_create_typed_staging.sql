@@ -1,4 +1,3 @@
-```sql
 -- 004_create_typed_staging.sql
 -- Purpose:
 --   Create typed staging tables from staging.*_raw, normalizing placeholders
