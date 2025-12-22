@@ -3,168 +3,114 @@
 --   Create typed staging tables from staging.*_raw, normalizing placeholders
 --   (NA, None, Not_Yet_Assessed, TBD, empty) to NULL, and casting where safe.
 --
+-- Key fix vs prior version:
+--   - Safe numeric parsing no longer produces invalid casts like "12-"
+--   - Values like "12-Oct" (Excel auto-date style) will parse to 12 (first numeric token)
+--
 -- Assumptions:
 --   - Raw tables exist: staging.kelps_raw, staging.microbes_raw
---   - staging.kelps_raw and staging.microbes_raw include ingest metadata cols:
---       staging_id, ingest_batch_id, source_filename, source_row_num, loaded_at
---
--- Notes:
---   - We DO NOT drop raw tables.
---   - We cast conservatively (dates, numerics, booleans). Anything ambiguous stays TEXT.
---   - Numeric parsing is hardened to avoid errors like "12-" (returns NULL instead of failing).
---   - Postgres identifiers > 63 chars are truncated; if your *_raw cols were truncated,
---     adjust the SELECT aliases accordingly.
+--   - staging.kelps_raw and staging.microbes_raw include the referenced columns
 
 BEGIN;
 
 CREATE SCHEMA IF NOT EXISTS staging;
 
 -- ============================================================
--- Helper functions (placeholders, numeric, boolean, date parse)
+-- TEMP helper functions (session-scoped; no persistent objects)
 -- ============================================================
 
--- Normalize common placeholders to NULL
-CREATE OR REPLACE FUNCTION staging.nullify_placeholder(p_text text)
+-- Normalize placeholders to NULL and trim whitespace
+CREATE OR REPLACE FUNCTION pg_temp.norm_text(p_text text)
 RETURNS text
 LANGUAGE sql
-IMMUTABLE
 AS $$
   SELECT CASE
     WHEN p_text IS NULL THEN NULL
     WHEN btrim(p_text) = '' THEN NULL
     WHEN lower(btrim(p_text)) IN (
-      'na','n/a','none','null',
-      'not_yet_assessed','not yet assessed',
-      'tbd','to_be_analyzed','to be analyzed'
+      'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed'
     ) THEN NULL
     ELSE btrim(p_text)
-  END
+  END;
 $$;
 
--- Hardened numeric parsing (prevents invalid casts like "12-")
-CREATE OR REPLACE FUNCTION staging.parse_numeric(p_text text)
+-- Extract first numeric token from a string and cast to numeric
+-- Examples:
+--   '10'      -> 10
+--   '10 C'    -> 10
+--   '12-Oct'  -> 12     (fixes your current issue)
+--   '12-'     -> 12     (safe)
+--   '--'      -> NULL
+CREATE OR REPLACE FUNCTION pg_temp.safe_numeric(p_text text)
 RETURNS numeric
-LANGUAGE plpgsql
-IMMUTABLE
+LANGUAGE sql
 AS $$
-DECLARE
-  s text;
-BEGIN
-  s := staging.nullify_placeholder(p_text);
-  IF s IS NULL THEN
-    RETURN NULL;
-  END IF;
-
-  -- keep only digits, dot, minus
-  s := regexp_replace(trim(s), '[^0-9\.\-]+', '', 'g');
-  s := NULLIF(s, '');
-  IF s IS NULL THEN
-    RETURN NULL;
-  END IF;
-
-  -- reject common malformed remnants
-  IF s IN ('-', '.', '-.') THEN
-    RETURN NULL;
-  END IF;
-
-  -- only allow a single leading minus
-  IF s ~ '.*-.*-.*' OR (position('-' in s) > 1) THEN
-    RETURN NULL;
-  END IF;
-
-  -- reject trailing '-' or trailing '.'
-  IF s ~ '-$' OR s ~ '\.$' THEN
-    RETURN NULL;
-  END IF;
-
-  -- strict numeric pattern
-  IF s !~ '^\-?\d+(\.\d+)?$' THEN
-    RETURN NULL;
-  END IF;
-
-  RETURN s::numeric;
-
-EXCEPTION WHEN others THEN
-  RETURN NULL;
-END;
+  SELECT CASE
+    WHEN pg_temp.norm_text(p_text) IS NULL THEN NULL
+    ELSE (
+      SELECT (regexp_match(pg_temp.norm_text(p_text), '(-?\d+(?:\.\d+)?)'))[1]::numeric
+    )
+  END;
 $$;
 
--- Parse booleans from common yes/no strings; returns NULL if unknown/placeholder
-CREATE OR REPLACE FUNCTION staging.parse_bool(p_text text)
+-- Extract first integer token and cast to int
+CREATE OR REPLACE FUNCTION pg_temp.safe_int(p_text text)
+RETURNS integer
+LANGUAGE sql
+AS $$
+  SELECT CASE
+    WHEN pg_temp.norm_text(p_text) IS NULL THEN NULL
+    ELSE (
+      SELECT (regexp_match(pg_temp.norm_text(p_text), '(\d+)'))[1]::int
+    )
+  END;
+$$;
+
+-- Best-effort boolean parsing
+CREATE OR REPLACE FUNCTION pg_temp.safe_bool(p_text text)
 RETURNS boolean
 LANGUAGE sql
-IMMUTABLE
 AS $$
   SELECT CASE
-    WHEN staging.nullify_placeholder(p_text) IS NULL THEN NULL
-    WHEN lower(staging.nullify_placeholder(p_text)) IN ('yes','true','1','y','t') THEN true
-    WHEN lower(staging.nullify_placeholder(p_text)) IN ('no','false','0','n','f') THEN false
+    WHEN pg_temp.norm_text(p_text) IS NULL THEN NULL
+    WHEN lower(pg_temp.norm_text(p_text)) IN ('yes','true','1','y','t') THEN true
+    WHEN lower(pg_temp.norm_text(p_text)) IN ('no','false','0','n','f') THEN false
     ELSE NULL
-  END
+  END;
 $$;
 
--- Parse dates from a few common patterns; returns NULL if unknown/placeholder/unparseable
-CREATE OR REPLACE FUNCTION staging.parse_date(p_text text)
+-- Best-effort date parsing (keeps NULL on failure)
+-- Supports:
+--   YYYY-MM-DD
+--   DD-Mon-YY / DD-Mon-YYYY
+--   MM/DD/YYYY
+CREATE OR REPLACE FUNCTION pg_temp.safe_date(p_text text)
 RETURNS date
-LANGUAGE plpgsql
-IMMUTABLE
-AS $$
-DECLARE
-  s text;
-BEGIN
-  s := staging.nullify_placeholder(p_text);
-  IF s IS NULL THEN
-    RETURN NULL;
-  END IF;
-
-  -- DD-Mon-YY or DD-Mon-YYYY (e.g., 07-Jan-24, 07-Jan-2024)
-  IF s ~ '^\d{1,2}-[A-Za-z]{3}-\d{2,4}$' THEN
-    IF length(s) = 9 THEN
-      RETURN to_date(s, 'DD-Mon-YY');
-    ELSE
-      RETURN to_date(s, 'DD-Mon-YYYY');
-    END IF;
-  END IF;
-
-  -- MM/DD/YYYY
-  IF s ~ '^\d{1,2}/\d{1,2}/\d{4}$' THEN
-    RETURN to_date(s, 'MM/DD/YYYY');
-  END IF;
-
-  -- YYYY-MM-DD
-  IF s ~ '^\d{4}-\d{2}-\d{2}$' THEN
-    RETURN to_date(s, 'YYYY-MM-DD');
-  END IF;
-
-  RETURN NULL;
-EXCEPTION WHEN others THEN
-  RETURN NULL;
-END;
-$$;
-
--- Parse lat/long decimal degrees only (DMS stays NULL for now)
-CREATE OR REPLACE FUNCTION staging.parse_decimal_degrees(p_text text)
-RETURNS numeric
 LANGUAGE sql
-IMMUTABLE
 AS $$
   SELECT CASE
-    WHEN staging.nullify_placeholder(p_text) IS NULL THEN NULL
-    WHEN staging.nullify_placeholder(p_text) ~ '^\s*-?\d+(\.\d+)?\s*$'
-      THEN btrim(staging.nullify_placeholder(p_text))::numeric
+    WHEN pg_temp.norm_text(p_text) IS NULL THEN NULL
+    WHEN pg_temp.norm_text(p_text) ~ '^\d{4}-\d{2}-\d{2}$'
+      THEN to_date(pg_temp.norm_text(p_text), 'YYYY-MM-DD')
+    WHEN pg_temp.norm_text(p_text) ~ '^\d{1,2}-[A-Za-z]{3}-\d{2}$'
+      THEN to_date(pg_temp.norm_text(p_text), 'DD-Mon-YY')
+    WHEN pg_temp.norm_text(p_text) ~ '^\d{1,2}-[A-Za-z]{3}-\d{4}$'
+      THEN to_date(pg_temp.norm_text(p_text), 'DD-Mon-YYYY')
+    WHEN pg_temp.norm_text(p_text) ~ '^\d{1,2}/\d{1,2}/\d{4}$'
+      THEN to_date(pg_temp.norm_text(p_text), 'MM/DD/YYYY')
     ELSE NULL
-  END
+  END;
 $$;
 
--- ==================================
--- Drop & recreate typed staging tables
--- ==================================
+-- ============================================================
+-- Drop & recreate typed tables
+-- ============================================================
 DROP TABLE IF EXISTS staging.kelps_typed;
 DROP TABLE IF EXISTS staging.microbes_typed;
 
--- =========================
+-- ============================================================
 -- KELPS_TYPED
--- =========================
+-- ============================================================
 CREATE TABLE staging.kelps_typed (
   typed_id          BIGSERIAL PRIMARY KEY,
 
@@ -326,247 +272,182 @@ CREATE TABLE staging.kelps_typed (
   commercial_supply_logistics_carbon_footprint_transport_num NUMERIC NULL
 );
 
-INSERT INTO staging.kelps_typed (
-  staging_id, ingest_batch_id, source_filename, source_row_num, loaded_at,
-
-  taxonomy_genus, taxonomy_species, taxonomy_sex, taxonomy_variety_or_form,
-
-  storage_details_id, storage_details_position_id, storage_details_rack_id,
-  storage_details_location, storage_details_temperature_c_raw,
-  storage_details_temperature_c_num, storage_details_medium,
-
-  sampling_metadata_country, sampling_metadata_latitude_raw, sampling_metadata_longitude_raw,
-  sampling_metadata_latitude_num, sampling_metadata_longitude_num,
-  sampling_metadata_collection_date_raw, sampling_metadata_collection_date,
-  sampling_metadata_personnel_collected,
-  sampling_metadata_isolation_date_raw, sampling_metadata_isolation_date,
-  sampling_metadata_deposit_date_raw, sampling_metadata_deposit_date,
-  sampling_metadata_deposited_by, sampling_metadata_permit, sampling_metadata_collection_site,
-
-  other_previously_housed_location, sponsorship_strain_sponsorship_status, sponsorship_code,
-
-  phenotypic_data_growth_rate_raw, phenotypic_data_growth_rate_num,
-  phenotypic_data_optimal_growth_conditions,
-  phenotypic_data_percent_viability_raw, phenotypic_data_percent_viability_num,
-  phenotypic_data_lifespan,
-  phenotypic_data_tolerance_to_thermal_stressor,
-  phenotypic_data_tolerance_to_water_quality_stressors,
-
-  inaturalist,
-  ecological_role_primary_producer, ecological_role_carbon_sink, ecological_role_habitat_former,
-
-  metabolic_pathways_kegg_pathway_id, metabolic_pathways_metacyc_pathway_id,
-  functional_annotation_gene_function_id, functional_annotation_protein_function_id,
-
-  genetic_variation_data_variant_id, genetic_variation_data_gene_id, genetic_variation_data_chromosome,
-  genetic_variation_data_reference_allele, genetic_variation_data_alternate_allele,
-  genetic_variation_data_variant_type,
-  genetic_variation_data_allele_frequency_raw, genetic_variation_data_allele_frequency_num,
-  genetic_variation_data_read_depth_raw, genetic_variation_data_read_depth_num,
-  genetic_variation_data_quality_score_raw, genetic_variation_data_quality_score_num,
-  genetic_variation_data_genotype,
-
-  genetic_diversity_fst_raw, genetic_diversity_fst_num,
-  genetic_diversity_observed_heterozygosity_raw, genetic_diversity_observed_heterozygosity_num,
-  genetic_diversity_observed_homozygosity_raw, genetic_diversity_observed_homozygosity_num,
-  genetic_diversity_allele_count_raw, genetic_diversity_allele_count_num,
-  genetic_diversity_nucleotide_diversity_raw, genetic_diversity_nucleotide_diversity_num,
-
-  phenotypic_diversity_trait_id_name,
-  phenotypic_diversity_trait_variance_raw, phenotypic_diversity_trait_variance_num,
-  phenotypic_diversity_trait_mean_raw, phenotypic_diversity_trait_mean_num,
-  phenotypic_diversity_trait_standard_deviation_raw, phenotypic_diversity_trait_standard_deviation_num,
-  phenotypic_diversity_trait_range,
-
-  iucn_red_list_extinct_ex, iucn_red_list_extinct_in_the_wild_ew,
-  iucn_red_list_critically_endangered_cr, iucn_red_list_endangered_en,
-  iucn_red_list_vulnerable_vu, iucn_red_list_least_concern,
-  iucn_red_list_data_deficient_dd, iucn_red_list_not_evaluated_ne,
-
-  ecosystem_endemic, ecosystem_naturalized, ecosystem_invasive, ecosystem_adventive,
-  ecosystem_extirpated, ecosystem_weed, ecosystem_cultivated_horticultural,
-  ecosystem_ruderal, ecosystem_pioneer,
-
-  commercial_bio_variables_harvestable_yield_per_cycle_raw,
-  commercial_bio_variables_harvestable_yield_per_cycle_num,
-  commercial_bio_variables_harvest_season, commercial_bio_variables_light_needed,
-  commercial_production_spoilage_rate_raw, commercial_production_spoilage_rate_num,
-  commercial_production_operational_cost_per_cycle_raw,
-  commercial_production_operational_cost_per_cycle_num,
-  commercial_production_gross_margin_raw, commercial_production_gross_margin_num,
-  commercial_market_price_volatility_index_raw, commercial_market_price_volatility_index_num,
-  commercial_market_demand_index_sector,
-  commercial_market_market_growth_rate_raw, commercial_market_market_growth_rate_num,
-  commercial_processing_moisture_content_raw, commercial_processing_moisture_content_num,
-  commercial_processing_protein_content_raw, commercial_processing_protein_content_num,
-  commercial_processing_alginate_or_carrageenan_content_raw,
-  commercial_processing_alginate_or_carrageenan_content_num,
-  commercial_processing_contaminants, commercial_processing_shelf_life,
-  commercial_processing_grade_quality_score_raw, commercial_processing_grade_quality_score_num,
-  commercial_supply_logistics_transport_cost_raw, commercial_supply_logistics_transport_cost_num,
-  commercial_supply_logistics_distribution_channel,
-  commercial_supply_logistics_carbon_footprint_transport_raw,
-  commercial_supply_logistics_carbon_footprint_transport_num
-)
+INSERT INTO staging.kelps_typed
 SELECT
+  -- Ingest metadata
   k.staging_id,
   k.ingest_batch_id,
   k.source_filename,
   k.source_row_num,
   k.loaded_at,
 
-  staging.nullify_placeholder(k.taxonomy_genus),
-  staging.nullify_placeholder(k.taxonomy_species),
-  staging.nullify_placeholder(k.taxonomy_sex),
-  staging.nullify_placeholder(k.taxonomy_variety_or_form),
+  -- Taxonomy
+  pg_temp.norm_text(k.taxonomy_genus),
+  pg_temp.norm_text(k.taxonomy_species),
+  pg_temp.norm_text(k.taxonomy_sex),
+  pg_temp.norm_text(k.taxonomy_variety_or_form),
 
-  staging.nullify_placeholder(k.storage_details_id),
-  staging.nullify_placeholder(k.storage_details_position_id),
-  staging.nullify_placeholder(k.storage_details_rack_id),
-  staging.nullify_placeholder(k.storage_details_location),
-  staging.nullify_placeholder(k.storage_details_temperature_c) AS storage_details_temperature_c_raw,
-  staging.parse_numeric(k.storage_details_temperature_c) AS storage_details_temperature_c_num,
-  staging.nullify_placeholder(k.storage_details_medium),
+  -- Storage
+  pg_temp.norm_text(k.storage_details_id),
+  pg_temp.norm_text(k.storage_details_position_id),
+  pg_temp.norm_text(k.storage_details_rack_id),
+  pg_temp.norm_text(k.storage_details_location),
+  pg_temp.norm_text(k.storage_details_temperature_c),
+  pg_temp.safe_numeric(k.storage_details_temperature_c),
+  pg_temp.norm_text(k.storage_details_medium),
 
-  staging.nullify_placeholder(k.sampling_metadata_country),
-  staging.nullify_placeholder(k.sampling_metadata_latitude) AS sampling_metadata_latitude_raw,
-  staging.nullify_placeholder(k.sampling_metadata_longitude) AS sampling_metadata_longitude_raw,
-  staging.parse_decimal_degrees(k.sampling_metadata_latitude) AS sampling_metadata_latitude_num,
-  staging.parse_decimal_degrees(k.sampling_metadata_longitude) AS sampling_metadata_longitude_num,
-  staging.nullify_placeholder(k.sampling_metadata_collection_date) AS sampling_metadata_collection_date_raw,
-  staging.parse_date(k.sampling_metadata_collection_date) AS sampling_metadata_collection_date,
-  staging.nullify_placeholder(k.sampling_metadata_personnel_collected),
-  staging.nullify_placeholder(k.sampling_metadata_isolation_date) AS sampling_metadata_isolation_date_raw,
-  staging.parse_date(k.sampling_metadata_isolation_date) AS sampling_metadata_isolation_date,
-  staging.nullify_placeholder(k.sampling_metadata_deposit_date) AS sampling_metadata_deposit_date_raw,
-  staging.parse_date(k.sampling_metadata_deposit_date) AS sampling_metadata_deposit_date,
-  staging.nullify_placeholder(k.sampling_metadata_deposited_by),
-  staging.nullify_placeholder(k.sampling_metadata_permit),
-  staging.nullify_placeholder(k.sampling_metadata_collection_site),
+  -- Sampling metadata
+  pg_temp.norm_text(k.sampling_metadata_country),
+  pg_temp.norm_text(k.sampling_metadata_latitude),
+  pg_temp.norm_text(k.sampling_metadata_longitude),
+  CASE
+    WHEN pg_temp.norm_text(k.sampling_metadata_latitude) ~ '^\s*-?\d+(\.\d+)?\s*$'
+      THEN pg_temp.safe_numeric(k.sampling_metadata_latitude)
+    ELSE NULL
+  END,
+  CASE
+    WHEN pg_temp.norm_text(k.sampling_metadata_longitude) ~ '^\s*-?\d+(\.\d+)?\s*$'
+      THEN pg_temp.safe_numeric(k.sampling_metadata_longitude)
+    ELSE NULL
+  END,
+  pg_temp.norm_text(k.sampling_metadata_collection_date),
+  pg_temp.safe_date(k.sampling_metadata_collection_date),
+  pg_temp.norm_text(k.sampling_metadata_personnel_collected),
+  pg_temp.norm_text(k.sampling_metadata_isolation_date),
+  pg_temp.safe_date(k.sampling_metadata_isolation_date),
+  pg_temp.norm_text(k.sampling_metadata_deposit_date),
+  pg_temp.safe_date(k.sampling_metadata_deposit_date),
+  pg_temp.norm_text(k.sampling_metadata_deposited_by),
+  pg_temp.norm_text(k.sampling_metadata_permit),
+  pg_temp.norm_text(k.sampling_metadata_collection_site),
 
-  staging.nullify_placeholder(k.other_previously_housed_location),
-  staging.nullify_placeholder(k.sponsorship_strain_sponsorship_status),
-  staging.nullify_placeholder(k.sponsorship_code),
+  -- Misc provenance
+  pg_temp.norm_text(k.other_previously_housed_location),
+  pg_temp.norm_text(k.sponsorship_strain_sponsorship_status),
+  pg_temp.norm_text(k.sponsorship_code),
 
-  staging.nullify_placeholder(k.phenotypic_data_growth_rate) AS phenotypic_data_growth_rate_raw,
-  staging.parse_numeric(k.phenotypic_data_growth_rate) AS phenotypic_data_growth_rate_num,
-  staging.nullify_placeholder(k.phenotypic_data_optimal_growth_conditions),
-  staging.nullify_placeholder(k.phenotypic_data_percent_viability) AS phenotypic_data_percent_viability_raw,
-  staging.parse_numeric(k.phenotypic_data_percent_viability) AS phenotypic_data_percent_viability_num,
-  staging.nullify_placeholder(k.phenotypic_data_lifespan),
-  staging.nullify_placeholder(k.phenotypic_data_tolerance_to_thermal_stressor),
-  staging.nullify_placeholder(k.phenotypic_data_tolerance_to_water_quality_stressors),
+  -- Phenotypic
+  pg_temp.norm_text(k.phenotypic_data_growth_rate),
+  pg_temp.safe_numeric(k.phenotypic_data_growth_rate),
+  pg_temp.norm_text(k.phenotypic_data_optimal_growth_conditions),
+  pg_temp.norm_text(k.phenotypic_data_percent_viability),
+  pg_temp.safe_numeric(k.phenotypic_data_percent_viability),
+  pg_temp.norm_text(k.phenotypic_data_lifespan),
+  pg_temp.norm_text(k.phenotypic_data_tolerance_to_thermal_stressor),
+  pg_temp.norm_text(k.phenotypic_data_tolerance_to_water_quality_stressors),
 
-  staging.nullify_placeholder(k.inaturalist),
-  staging.nullify_placeholder(k.ecological_role_primary_producer),
-  staging.nullify_placeholder(k.ecological_role_carbon_sink),
-  staging.nullify_placeholder(k.ecological_role_habitat_former),
+  -- Links / annotations
+  pg_temp.norm_text(k.inaturalist),
 
-  staging.nullify_placeholder(k.metabolic_pathways_kegg_pathway_id),
-  staging.nullify_placeholder(k.metabolic_pathways_metacyc_pathway_id),
-  staging.nullify_placeholder(k.functional_annotation_gene_function_id),
-  staging.nullify_placeholder(k.functional_annotation_protein_function_id),
+  -- Ecological roles
+  pg_temp.norm_text(k.ecological_role_primary_producer),
+  pg_temp.norm_text(k.ecological_role_carbon_sink),
+  pg_temp.norm_text(k.ecological_role_habitat_former),
 
-  staging.nullify_placeholder(k.genetic_variation_data_variant_id),
-  staging.nullify_placeholder(k.genetic_variation_data_gene_id),
-  staging.nullify_placeholder(k.genetic_variation_data_chromosome),
-  staging.nullify_placeholder(k.genetic_variation_data_reference_allele),
-  staging.nullify_placeholder(k.genetic_variation_data_alternate_allele),
-  staging.nullify_placeholder(k.genetic_variation_data_variant_type),
-  staging.nullify_placeholder(k.genetic_variation_data_allele_frequency) AS genetic_variation_data_allele_frequency_raw,
-  staging.parse_numeric(k.genetic_variation_data_allele_frequency) AS genetic_variation_data_allele_frequency_num,
-  staging.nullify_placeholder(k.genetic_variation_data_read_depth) AS genetic_variation_data_read_depth_raw,
-  staging.parse_numeric(k.genetic_variation_data_read_depth) AS genetic_variation_data_read_depth_num,
-  staging.nullify_placeholder(k.genetic_variation_data_quality_score) AS genetic_variation_data_quality_score_raw,
-  staging.parse_numeric(k.genetic_variation_data_quality_score) AS genetic_variation_data_quality_score_num,
-  staging.nullify_placeholder(k.genetic_variation_data_genotype),
+  -- Pathways / annotation ids
+  pg_temp.norm_text(k.metabolic_pathways_kegg_pathway_id),
+  pg_temp.norm_text(k.metabolic_pathways_metacyc_pathway_id),
+  pg_temp.norm_text(k.functional_annotation_gene_function_id),
+  pg_temp.norm_text(k.functional_annotation_protein_function_id),
 
-  -- Diversity: if your raw columns were truncated by Postgres, update these names.
-  staging.nullify_placeholder(k.genetic_diversity_within_geography_sample_sets_fst) AS genetic_diversity_fst_raw,
-  staging.parse_numeric(k.genetic_diversity_within_geography_sample_sets_fst) AS genetic_diversity_fst_num,
-  staging.nullify_placeholder(k.genetic_diversity_within_geography_sample_sets_observed_heteroz) AS genetic_diversity_observed_heterozygosity_raw,
-  staging.parse_numeric(k.genetic_diversity_within_geography_sample_sets_observed_heteroz) AS genetic_diversity_observed_heterozygosity_num,
-  staging.nullify_placeholder(k.genetic_diversity_within_geography_sample_sets_observed_homozyg) AS genetic_diversity_observed_homozygosity_raw,
-  staging.parse_numeric(k.genetic_diversity_within_geography_sample_sets_observed_homozyg) AS genetic_diversity_observed_homozygosity_num,
-  staging.nullify_placeholder(k.genetic_diversity_within_geography_sample_sets_allele_count) AS genetic_diversity_allele_count_raw,
-  staging.parse_numeric(k.genetic_diversity_within_geography_sample_sets_allele_count) AS genetic_diversity_allele_count_num,
-  staging.nullify_placeholder(k.genetic_diversity_within_geography_sample_sets_nucleotide_diver) AS genetic_diversity_nucleotide_diversity_raw,
-  staging.parse_numeric(k.genetic_diversity_within_geography_sample_sets_nucleotide_diver) AS genetic_diversity_nucleotide_diversity_num,
+  -- Genetic variation
+  pg_temp.norm_text(k.genetic_variation_data_variant_id),
+  pg_temp.norm_text(k.genetic_variation_data_gene_id),
+  pg_temp.norm_text(k.genetic_variation_data_chromosome),
+  pg_temp.norm_text(k.genetic_variation_data_reference_allele),
+  pg_temp.norm_text(k.genetic_variation_data_alternate_allele),
+  pg_temp.norm_text(k.genetic_variation_data_variant_type),
+  pg_temp.norm_text(k.genetic_variation_data_allele_frequency),
+  pg_temp.safe_numeric(k.genetic_variation_data_allele_frequency),
+  pg_temp.norm_text(k.genetic_variation_data_read_depth),
+  pg_temp.safe_numeric(k.genetic_variation_data_read_depth),
+  pg_temp.norm_text(k.genetic_variation_data_quality_score),
+  pg_temp.safe_numeric(k.genetic_variation_data_quality_score),
+  pg_temp.norm_text(k.genetic_variation_data_genotype),
 
-  staging.nullify_placeholder(k.phenotypic_diversity_within_geography_sample_sets_trait_id_name) AS phenotypic_diversity_trait_id_name,
-  staging.nullify_placeholder(k.phenotypic_diversity_within_geography_sample_sets_trait_varianc) AS phenotypic_diversity_trait_variance_raw,
-  staging.parse_numeric(k.phenotypic_diversity_within_geography_sample_sets_trait_varianc) AS phenotypic_diversity_trait_variance_num,
-  staging.nullify_placeholder(k.phenotypic_diversity_within_geography_sample_sets_trait_mean) AS phenotypic_diversity_trait_mean_raw,
-  staging.parse_numeric(k.phenotypic_diversity_within_geography_sample_sets_trait_mean) AS phenotypic_diversity_trait_mean_num,
-  staging.nullify_placeholder(k.phenotypic_diversity_within_geography_sample_sets_trait_standar) AS phenotypic_diversity_trait_standard_deviation_raw,
-  staging.parse_numeric(k.phenotypic_diversity_within_geography_sample_sets_trait_standar) AS phenotypic_diversity_trait_standard_deviation_num,
-  staging.nullify_placeholder(k.phenotypic_diversity_within_geography_sample_sets_trait_range) AS phenotypic_diversity_trait_range,
+  -- Diversity stats (note: your raw has truncated column names here; keep using what worked for you)
+  pg_temp.norm_text(k.genetic_diversity_within_geography_sample_sets_fst),
+  pg_temp.safe_numeric(k.genetic_diversity_within_geography_sample_sets_fst),
+  pg_temp.norm_text(k.genetic_diversity_within_geography_sample_sets_observed_heteroz),
+  pg_temp.safe_numeric(k.genetic_diversity_within_geography_sample_sets_observed_heteroz),
+  pg_temp.norm_text(k.genetic_diversity_within_geography_sample_sets_observed_homozyg),
+  pg_temp.safe_numeric(k.genetic_diversity_within_geography_sample_sets_observed_homozyg),
+  pg_temp.norm_text(k.genetic_diversity_within_geography_sample_sets_allele_count),
+  pg_temp.safe_numeric(k.genetic_diversity_within_geography_sample_sets_allele_count),
+  pg_temp.norm_text(k.genetic_diversity_within_geography_sample_sets_nucleotide_diver),
+  pg_temp.safe_numeric(k.genetic_diversity_within_geography_sample_sets_nucleotide_diver),
+
+  pg_temp.norm_text(k.phenotypic_diversity_within_geography_sample_sets_trait_id_name),
+  pg_temp.norm_text(k.phenotypic_diversity_within_geography_sample_sets_trait_varianc),
+  pg_temp.safe_numeric(k.phenotypic_diversity_within_geography_sample_sets_trait_varianc),
+  pg_temp.norm_text(k.phenotypic_diversity_within_geography_sample_sets_trait_mean),
+  pg_temp.safe_numeric(k.phenotypic_diversity_within_geography_sample_sets_trait_mean),
+  pg_temp.norm_text(k.phenotypic_diversity_within_geography_sample_sets_trait_standar),
+  pg_temp.safe_numeric(k.phenotypic_diversity_within_geography_sample_sets_trait_standar),
+  pg_temp.norm_text(k.phenotypic_diversity_within_geography_sample_sets_trait_range),
 
   -- IUCN flags
-  staging.parse_bool(k.iucn_red_list_extinct_ex),
-  staging.parse_bool(k.iucn_red_list_extinct_in_the_wild_ew),
-  staging.parse_bool(k.iucn_red_list_critically_endangered_cr),
-  staging.parse_bool(k.iucn_red_list_endangered_en),
-  staging.parse_bool(k.iucn_red_list_vulnerable_vu),
-  staging.parse_bool(k.iucn_red_list_least_concern),
-  staging.parse_bool(k.iucn_red_list_data_deficient_dd),
-  staging.parse_bool(k.iucn_red_list_not_evaluated_ne),
+  pg_temp.safe_bool(k.iucn_red_list_extinct_ex),
+  pg_temp.safe_bool(k.iucn_red_list_extinct_in_the_wild_ew),
+  pg_temp.safe_bool(k.iucn_red_list_critically_endangered_cr),
+  pg_temp.safe_bool(k.iucn_red_list_endangered_en),
+  pg_temp.safe_bool(k.iucn_red_list_vulnerable_vu),
+  pg_temp.safe_bool(k.iucn_red_list_least_concern),
+  pg_temp.safe_bool(k.iucn_red_list_data_deficient_dd),
+  pg_temp.safe_bool(k.iucn_red_list_not_evaluated_ne),
 
   -- Ecosystem flags
-  staging.parse_bool(k.ecosystem_endemic),
-  staging.parse_bool(k.ecosystem_naturalized),
-  staging.parse_bool(k.ecosystem_invasive),
-  staging.parse_bool(k.ecosystem_adventive),
-  staging.parse_bool(k.ecosystem_extirpated),
-  staging.parse_bool(k.ecosystem_weed),
-  staging.parse_bool(k.ecosystem_cultivated_horticultural),
-  staging.parse_bool(k.ecosystem_ruderal),
-  staging.parse_bool(k.ecosystem_pioneer),
+  pg_temp.safe_bool(k.ecosystem_endemic),
+  pg_temp.safe_bool(k.ecosystem_naturalized),
+  pg_temp.safe_bool(k.ecosystem_invasive),
+  pg_temp.safe_bool(k.ecosystem_adventive),
+  pg_temp.safe_bool(k.ecosystem_extirpated),
+  pg_temp.safe_bool(k.ecosystem_weed),
+  pg_temp.safe_bool(k.ecosystem_cultivated_horticultural),
+  pg_temp.safe_bool(k.ecosystem_ruderal),
+  pg_temp.safe_bool(k.ecosystem_pioneer),
 
   -- Commercial
-  staging.nullify_placeholder(k.commercial_bio_variables_harvestable_yield_per_cycle) AS commercial_bio_variables_harvestable_yield_per_cycle_raw,
-  staging.parse_numeric(k.commercial_bio_variables_harvestable_yield_per_cycle) AS commercial_bio_variables_harvestable_yield_per_cycle_num,
-  staging.nullify_placeholder(k.commercial_bio_variables_harvest_season),
-  staging.nullify_placeholder(k.commercial_bio_variables_light_needed),
+  pg_temp.norm_text(k.commercial_bio_variables_harvestable_yield_per_cycle),
+  pg_temp.safe_numeric(k.commercial_bio_variables_harvestable_yield_per_cycle),
+  pg_temp.norm_text(k.commercial_bio_variables_harvest_season),
+  pg_temp.norm_text(k.commercial_bio_variables_light_needed),
+  pg_temp.norm_text(k.commercial_production_spoilage_rate),
+  pg_temp.safe_numeric(k.commercial_production_spoilage_rate),
+  pg_temp.norm_text(k.commercial_production_operational_cost_per_cycle),
+  pg_temp.safe_numeric(k.commercial_production_operational_cost_per_cycle),
+  pg_temp.norm_text(k.commercial_production_gross_margin),
+  pg_temp.safe_numeric(k.commercial_production_gross_margin),
+  pg_temp.norm_text(k.commercial_market_price_volatility_index),
+  pg_temp.safe_numeric(k.commercial_market_price_volatility_index),
+  pg_temp.norm_text(k.commercial_market_demand_index_sector),
+  pg_temp.norm_text(k.commercial_market_market_growth_rate),
+  pg_temp.safe_numeric(k.commercial_market_market_growth_rate),
+  pg_temp.norm_text(k.commercial_processing_moisture_content),
+  pg_temp.safe_numeric(k.commercial_processing_moisture_content),
+  pg_temp.norm_text(k.commercial_processing_protein_content),
+  pg_temp.safe_numeric(k.commercial_processing_protein_content),
+  pg_temp.norm_text(k.commercial_processing_alginate_or_carrageenan_content),
+  pg_temp.safe_numeric(k.commercial_processing_alginate_or_carrageenan_content),
+  pg_temp.norm_text(k.commercial_processing_contaminants),
+  pg_temp.norm_text(k.commercial_processing_shelf_life),
+  pg_temp.norm_text(k.commercial_processing_grade_quality_score),
+  pg_temp.safe_numeric(k.commercial_processing_grade_quality_score),
+  pg_temp.norm_text(k.commercial_supply_logistics_transport_cost),
+  pg_temp.safe_numeric(k.commercial_supply_logistics_transport_cost),
+  pg_temp.norm_text(k.commercial_supply_logistics_distribution_channel),
+  pg_temp.norm_text(k.commercial_supply_logistics_carbon_footprint_transport),
+  pg_temp.safe_numeric(k.commercial_supply_logistics_carbon_footprint_transport)
 
-  staging.nullify_placeholder(k.commercial_production_spoilage_rate) AS commercial_production_spoilage_rate_raw,
-  staging.parse_numeric(k.commercial_production_spoilage_rate) AS commercial_production_spoilage_rate_num,
-  staging.nullify_placeholder(k.commercial_production_operational_cost_per_cycle) AS commercial_production_operational_cost_per_cycle_raw,
-  staging.parse_numeric(k.commercial_production_operational_cost_per_cycle) AS commercial_production_operational_cost_per_cycle_num,
-  staging.nullify_placeholder(k.commercial_production_gross_margin) AS commercial_production_gross_margin_raw,
-  staging.parse_numeric(k.commercial_production_gross_margin) AS commercial_production_gross_margin_num,
-
-  staging.nullify_placeholder(k.commercial_market_price_volatility_index) AS commercial_market_price_volatility_index_raw,
-  staging.parse_numeric(k.commercial_market_price_volatility_index) AS commercial_market_price_volatility_index_num,
-  staging.nullify_placeholder(k.commercial_market_demand_index_sector),
-  staging.nullify_placeholder(k.commercial_market_market_growth_rate) AS commercial_market_market_growth_rate_raw,
-  staging.parse_numeric(k.commercial_market_market_growth_rate) AS commercial_market_market_growth_rate_num,
-
-  staging.nullify_placeholder(k.commercial_processing_moisture_content) AS commercial_processing_moisture_content_raw,
-  staging.parse_numeric(k.commercial_processing_moisture_content) AS commercial_processing_moisture_content_num,
-  staging.nullify_placeholder(k.commercial_processing_protein_content) AS commercial_processing_protein_content_raw,
-  staging.parse_numeric(k.commercial_processing_protein_content) AS commercial_processing_protein_content_num,
-  staging.nullify_placeholder(k.commercial_processing_alginate_or_carrageenan_content) AS commercial_processing_alginate_or_carrageenan_content_raw,
-  staging.parse_numeric(k.commercial_processing_alginate_or_carrageenan_content) AS commercial_processing_alginate_or_carrageenan_content_num,
-  staging.nullify_placeholder(k.commercial_processing_contaminants),
-  staging.nullify_placeholder(k.commercial_processing_shelf_life),
-  staging.nullify_placeholder(k.commercial_processing_grade_quality_score) AS commercial_processing_grade_quality_score_raw,
-  staging.parse_numeric(k.commercial_processing_grade_quality_score) AS commercial_processing_grade_quality_score_num,
-
-  staging.nullify_placeholder(k.commercial_supply_logistics_transport_cost) AS commercial_supply_logistics_transport_cost_raw,
-  staging.parse_numeric(k.commercial_supply_logistics_transport_cost) AS commercial_supply_logistics_transport_cost_num,
-  staging.nullify_placeholder(k.commercial_supply_logistics_distribution_channel),
-  staging.nullify_placeholder(k.commercial_supply_logistics_carbon_footprint_transport) AS commercial_supply_logistics_carbon_footprint_transport_raw,
-  staging.parse_numeric(k.commercial_supply_logistics_carbon_footprint_transport) AS commercial_supply_logistics_carbon_footprint_transport_num
 FROM staging.kelps_raw k;
 
 CREATE INDEX IF NOT EXISTS idx_kelps_typed_batch ON staging.kelps_typed (ingest_batch_id);
 CREATE INDEX IF NOT EXISTS idx_kelps_typed_storage_id ON staging.kelps_typed (storage_details_id);
 CREATE INDEX IF NOT EXISTS idx_kelps_typed_taxon ON staging.kelps_typed (taxonomy_genus, taxonomy_species);
 
--- =========================
+-- ============================================================
 -- MICROBES_TYPED
--- =========================
+-- ============================================================
 CREATE TABLE staging.microbes_typed (
   typed_id          BIGSERIAL PRIMARY KEY,
 
@@ -658,131 +539,122 @@ CREATE TABLE staging.microbes_typed (
   probiotic_known_host TEXT NULL
 );
 
-INSERT INTO staging.microbes_typed (
-  staging_id, ingest_batch_id, source_filename, source_row_num, loaded_at,
-  microbe_id, original_code, institution_isolation_physically_conducted, isolated_year,
-  isolated_by, maintained_by, maintained_at,
-  kelp_host, kelp_ka_sample_id, source_if_ka_id, source_if_no_ka_id, kelp_location,
-  kelp_collection_temp_raw, kelp_collection_temp_num, kelp_collection_month, kelp_collection_season,
-  kelp_thallus_collection, kelp_collection_approach, kelp_collection_method,
-  microbe_isolation_methods, microbe_isolation_protocol, isolation_media,
-  location_stored1, location_1_temperature, location_stored2, location_2_temperature,
-  cryopreservation_date_raw, cryopreservation_date, cryo_storage_medium, cryo_storage_preservative,
-  cryo_revival_tested, cryo_backups_created, cryopreservation_protocol,
-  malditof_procedure, malditof_dataanalysis_complete, high_quality_malditof_data,
-  s16_pcr_completed, pcr_conducted_by, sanger_sequencing_completed, sequencing_date_raw, sequencing_date,
-  primers_used, sequencing_notes, sequencing_conducted_by,
-  total_bp_length_after_trimming, closest_ncbi_blast_tax_id, ncbi_blast_query_cover, percent_identity,
-  accession, taxonomy_kingdom, s16_sequence, its2_sequence,
-  pathogen_activity_kelp, pathogen_activity_humans, pathogen_activity_plants, pathogen_activity_animals,
-  growth_temperature_c_range, growth_salinity_range, growth_ph_range, growth_optimal_media,
-  morphology_colony_color, morphology_colony_size, morphology_colony_shape, morphology_colony_texture,
-  gram_stain, morphology_cell_shape, probiotic_activity, probiotic_known_host
-)
+INSERT INTO staging.microbes_typed
 SELECT
   m.staging_id, m.ingest_batch_id, m.source_filename, m.source_row_num, m.loaded_at,
 
-  staging.nullify_placeholder(m.microbe_id),
-  staging.nullify_placeholder(m.original_code),
-  staging.nullify_placeholder(m.institution_isolation_physically_conducted),
+  pg_temp.norm_text(m.microbe_id),
+  pg_temp.norm_text(m.original_code),
+  pg_temp.norm_text(m.institution_isolation_physically_conducted),
+  pg_temp.safe_int(m.isolated_year),
 
-  CASE
-    WHEN staging.nullify_placeholder(m.isolated_year) IS NULL THEN NULL
-    WHEN staging.nullify_placeholder(m.isolated_year) ~ '^\d{4}$' THEN staging.nullify_placeholder(m.isolated_year)::int
-    ELSE NULL
-  END,
+  pg_temp.norm_text(m.isolated_by),
+  pg_temp.norm_text(m.maintained_by),
+  pg_temp.norm_text(m.maintained_at),
 
-  staging.nullify_placeholder(m.isolated_by),
-  staging.nullify_placeholder(m.maintained_by),
-  staging.nullify_placeholder(m.maintained_at),
+  pg_temp.norm_text(m.kelp_host),
+  pg_temp.norm_text(m.kelp_ka_sample_id),
+  pg_temp.norm_text(m.source_if_ka_id),
+  pg_temp.norm_text(m.source_if_no_ka_id),
+  pg_temp.norm_text(m.kelp_location),
 
-  staging.nullify_placeholder(m.kelp_host),
-  staging.nullify_placeholder(m.kelp_ka_sample_id),
-  staging.nullify_placeholder(m.source_if_ka_id),
-  staging.nullify_placeholder(m.source_if_no_ka_id),
-  staging.nullify_placeholder(m.kelp_location),
+  pg_temp.norm_text(m.kelp_collection_temp),
+  pg_temp.safe_numeric(m.kelp_collection_temp),
+  pg_temp.norm_text(m.kelp_collection_month),
+  pg_temp.norm_text(m.kelp_collection_season),
+  pg_temp.norm_text(m.kelp_thallus_collection),
+  pg_temp.norm_text(m.kelp_collection_approach),
+  pg_temp.norm_text(m.kelp_collection_method),
 
-  staging.nullify_placeholder(m.kelp_collection_temp) AS kelp_collection_temp_raw,
-  staging.parse_numeric(m.kelp_collection_temp) AS kelp_collection_temp_num,
-  staging.nullify_placeholder(m.kelp_collection_month),
-  staging.nullify_placeholder(m.kelp_collection_season),
+  pg_temp.norm_text(m.microbe_isolation_methods),
+  pg_temp.norm_text(m.microbe_isolation_protocol),
+  pg_temp.norm_text(m.isolation_media),
 
-  staging.nullify_placeholder(m.kelp_thallus_collection),
-  staging.nullify_placeholder(m.kelp_collection_approach),
-  staging.nullify_placeholder(m.kelp_collection_method),
+  pg_temp.norm_text(m.location_stored1),
+  pg_temp.norm_text(m.location_1_temperature),
+  pg_temp.norm_text(m.location_stored2),
+  pg_temp.norm_text(m.location_2_temperature),
 
-  staging.nullify_placeholder(m.microbe_isolation_methods),
-  staging.nullify_placeholder(m.microbe_isolation_protocol),
-  staging.nullify_placeholder(m.isolation_media),
+  pg_temp.norm_text(m.cryopreservation_date),
+  pg_temp.safe_date(m.cryopreservation_date),
+  pg_temp.norm_text(m.cryo_storage_medium),
+  pg_temp.norm_text(m.cryo_storage_preservative),
+  pg_temp.safe_bool(m.cryo_revival_tested),
+  pg_temp.safe_bool(m.cryo_backups_created),
+  pg_temp.norm_text(m.cryopreservation_protocol),
 
-  staging.nullify_placeholder(m.location_stored1),
-  staging.nullify_placeholder(m.location_1_temperature),
-  staging.nullify_placeholder(m.location_stored2),
-  staging.nullify_placeholder(m.location_2_temperature),
+  pg_temp.safe_bool(m.malditof_procedure),
+  pg_temp.safe_bool(m.malditof_dataanalysis_complete),
+  pg_temp.norm_text(m.high_quality_malditof_data),
 
-  staging.nullify_placeholder(m.cryopreservation_date) AS cryopreservation_date_raw,
-  staging.parse_date(m.cryopreservation_date) AS cryopreservation_date,
-  staging.nullify_placeholder(m.cryo_storage_medium),
-  staging.nullify_placeholder(m.cryo_storage_preservative),
-  staging.parse_bool(m.cryo_revival_tested),
-  staging.parse_bool(m.cryo_backups_created),
-  staging.nullify_placeholder(m.cryopreservation_protocol),
+  pg_temp.safe_bool(m.s16_pcr_completed),
+  pg_temp.norm_text(m.pcr_conducted_by),
+  pg_temp.safe_bool(m.sanger_sequencing_completed),
+  pg_temp.norm_text(m.sequencing_date),
+  pg_temp.safe_date(m.sequencing_date),
+  pg_temp.norm_text(m.primers_used),
+  pg_temp.norm_text(m.sequencing_notes),
+  pg_temp.norm_text(m.sequencing_conducted_by),
 
-  staging.parse_bool(m.malditof_procedure),
-  staging.parse_bool(m.malditof_dataanalysis_complete),
-  staging.nullify_placeholder(m.high_quality_malditof_data),
+  pg_temp.safe_int(m.total_bp_length_after_trimming),
+  pg_temp.norm_text(m.closest_ncbi_blast_tax_id),
+  pg_temp.safe_numeric(m.ncbi_blast_query_cover),
+  pg_temp.safe_numeric(m.percent_identity),
+  pg_temp.norm_text(m.accession),
+  pg_temp.norm_text(m.taxonomy_kingdom),
 
-  staging.parse_bool(m.s16_pcr_completed),
-  staging.nullify_placeholder(m.pcr_conducted_by),
-  staging.parse_bool(m.sanger_sequencing_completed),
-  staging.nullify_placeholder(m.sequencing_date) AS sequencing_date_raw,
-  staging.parse_date(m.sequencing_date) AS sequencing_date,
-  staging.nullify_placeholder(m.primers_used),
-  staging.nullify_placeholder(m.sequencing_notes),
-  staging.nullify_placeholder(m.sequencing_conducted_by),
+  pg_temp.norm_text(m.s16_sequence),
+  pg_temp.norm_text(m.its2_sequence),
 
-  CASE
-    WHEN staging.nullify_placeholder(m.total_bp_length_after_trimming) IS NULL THEN NULL
-    WHEN staging.nullify_placeholder(m.total_bp_length_after_trimming) ~ '^\d+$'
-      THEN staging.nullify_placeholder(m.total_bp_length_after_trimming)::int
-    ELSE NULL
-  END,
-  staging.nullify_placeholder(m.closest_ncbi_blast_tax_id),
-  staging.parse_numeric(m.ncbi_blast_query_cover),
-  staging.parse_numeric(m.percent_identity),
-  staging.nullify_placeholder(m.accession),
-  staging.nullify_placeholder(m.taxonomy_kingdom),
+  pg_temp.norm_text(m.pathogen_activity_kelp),
+  pg_temp.norm_text(m.pathogen_activity_humans),
+  pg_temp.norm_text(m.pathogen_activity_plants),
+  pg_temp.norm_text(m.pathogen_activity_animals),
 
-  staging.nullify_placeholder(m.s16_sequence),
-  staging.nullify_placeholder(m.its2_sequence),
+  pg_temp.norm_text(m.growth_temperature_c_range),
+  pg_temp.norm_text(m.growth_salinity_range),
+  pg_temp.norm_text(m.growth_ph_range),
+  pg_temp.norm_text(m.growth_optimal_media),
 
-  staging.nullify_placeholder(m.pathogen_activity_kelp),
-  staging.nullify_placeholder(m.pathogen_activity_humans),
-  staging.nullify_placeholder(m.pathogen_activity_plants),
-  staging.nullify_placeholder(m.pathogen_activity_animals),
+  pg_temp.norm_text(m.morphology_colony_color),
+  pg_temp.norm_text(m.morphology_colony_size),
+  pg_temp.norm_text(m.morphology_colony_shape),
+  pg_temp.norm_text(m.morphology_colony_texture),
+  pg_temp.norm_text(m.gram_stain),
+  pg_temp.norm_text(m.morphology_cell_shape),
 
-  staging.nullify_placeholder(m.growth_temperature_c_range),
-  staging.nullify_placeholder(m.growth_salinity_range),
-  staging.nullify_placeholder(m.growth_ph_range),
-  staging.nullify_placeholder(m.growth_optimal_media),
+  pg_temp.norm_text(m.probiotic_activity),
+  pg_temp.norm_text(m.probiotic_known_host)
 
-  staging.nullify_placeholder(m.morphology_colony_color),
-  staging.nullify_placeholder(m.morphology_colony_size),
-  staging.nullify_placeholder(m.morphology_colony_shape),
-  staging.nullify_placeholder(m.morphology_colony_texture),
-  staging.nullify_placeholder(m.gram_stain),
-  staging.nullify_placeholder(m.morphology_cell_shape),
-
-  staging.nullify_placeholder(m.probiotic_activity),
-  staging.nullify_placeholder(m.probiotic_known_host)
 FROM staging.microbes_raw m;
 
 CREATE INDEX IF NOT EXISTS idx_microbes_typed_batch ON staging.microbes_typed (ingest_batch_id);
 CREATE INDEX IF NOT EXISTS idx_microbes_typed_microbe_id ON staging.microbes_typed (microbe_id);
 CREATE INDEX IF NOT EXISTS idx_microbes_typed_kelp_sample ON staging.microbes_typed (kelp_ka_sample_id);
 
--- Quick sanity checks (optional)
--- SELECT count(*) FROM staging.kelps_typed;
--- SELECT count(*) FROM staging.microbes_typed;
-
 COMMIT;
+
+-- ============================================================
+-- Optional sanity checks (run after script)
+-- ============================================================
+-- SELECT
+--   (SELECT count(*) FROM staging.kelps_raw)   AS kelps_raw_rows,
+--   (SELECT count(*) FROM staging.kelps_typed) AS kelps_typed_rows,
+--   (SELECT count(*) FROM staging.microbes_raw)   AS microbes_raw_rows,
+--   (SELECT count(*) FROM staging.microbes_typed) AS microbes_typed_rows;
+--
+-- -- Confirm the bad Excel-ish value now parses numerically:
+-- SELECT storage_details_temperature_c_raw,
+--        storage_details_temperature_c_num,
+--        count(*)
+-- FROM staging.kelps_typed
+-- GROUP BY 1,2
+-- ORDER BY count(*) DESC;
+--
+-- -- Show raw values that did NOT parse to numeric (good for cleanup rules):
+-- SELECT storage_details_temperature_c_raw, count(*)
+-- FROM staging.kelps_typed
+-- WHERE storage_details_temperature_c_raw IS NOT NULL
+--   AND storage_details_temperature_c_num IS NULL
+-- GROUP BY 1
+-- ORDER BY count(*) DESC;
