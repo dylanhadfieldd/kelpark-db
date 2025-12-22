@@ -1,7 +1,7 @@
 BEGIN;
 
 -- ============================================================
--- 006_structured_core.sql
+-- 005_structured_core.sql
 -- Core structured tables (MVP):
 --   structured.kelp_sample
 --   structured.microbe_isolate
@@ -13,12 +13,16 @@ BEGIN;
 CREATE SCHEMA IF NOT EXISTS structured;
 
 -- --------------------------------------------
--- 1) Core entity tables
+-- 1) Drop / recreate (repeatable rebuild)
 -- --------------------------------------------
 
 DROP TABLE IF EXISTS structured.microbe_kelp_link CASCADE;
 DROP TABLE IF EXISTS structured.microbe_isolate CASCADE;
 DROP TABLE IF EXISTS structured.kelp_sample CASCADE;
+
+-- --------------------------------------------
+-- 2) Core entity tables
+-- --------------------------------------------
 
 CREATE TABLE structured.kelp_sample (
   kelp_sample_id UUID PRIMARY KEY,
@@ -64,7 +68,6 @@ CREATE TABLE structured.kelp_sample (
   sponsorship_strain_sponsorship_status TEXT NULL,
   sponsorship_code TEXT NULL,
 
-  -- MVP: keep phenotypic as text; you can normalize later into trait tables
   phenotypic_data_growth_rate NUMERIC NULL,
   phenotypic_data_growth_rate_raw TEXT NULL,
   phenotypic_data_optimal_growth_conditions TEXT NULL,
@@ -175,26 +178,22 @@ CREATE TABLE structured.microbe_isolate (
   probiotic_known_host TEXT NULL
 );
 
--- Link table:
--- We store the raw reference IDs now. We can later add a resolver that fills kelp_sample_id.
 CREATE TABLE structured.microbe_kelp_link (
   microbe_kelp_link_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
-  microbe_isolate_id UUID NOT NULL REFERENCES structured.microbe_isolate(microbe_isolate_id) ON DELETE CASCADE,
+  microbe_isolate_id UUID NOT NULL
+    REFERENCES structured.microbe_isolate(microbe_isolate_id) ON DELETE CASCADE,
 
-  -- nullable until we have a stable kelp identifier to match on
-  kelp_sample_id UUID NULL REFERENCES structured.kelp_sample(kelp_sample_id) ON DELETE SET NULL,
+  kelp_sample_id UUID NULL
+    REFERENCES structured.kelp_sample(kelp_sample_id) ON DELETE SET NULL,
 
-  -- raw linkage fields from microbes
   kelp_ka_sample_id TEXT NULL,
   source_if_ka_id TEXT NULL,
   source_if_no_ka_id TEXT NULL,
 
-  -- helpful context
   kelp_host TEXT NULL,
   kelp_location TEXT NULL,
 
-  -- Keep lineage for debugging joins
   microbe_staging_id BIGINT NOT NULL
 );
 
@@ -208,7 +207,7 @@ CREATE INDEX IF NOT EXISTS idx_microbe_kelp_link_ka_sample_id
   ON structured.microbe_kelp_link(kelp_ka_sample_id);
 
 -- --------------------------------------------
--- 2) Load from typed (stable, repeatable)
+-- 3) Load from typed
 -- --------------------------------------------
 
 INSERT INTO structured.kelp_sample (
@@ -325,7 +324,7 @@ SELECT
   probiotic_activity, probiotic_known_host
 FROM staging.microbes_typed;
 
--- Link rows (unresolved kelp FK for now)
+-- Correct link insert (no empty-string links)
 INSERT INTO structured.microbe_kelp_link (
   microbe_isolate_id,
   kelp_sample_id,
@@ -339,24 +338,20 @@ INSERT INTO structured.microbe_kelp_link (
 SELECT
   mi.microbe_isolate_id,
   NULL::uuid AS kelp_sample_id,
-  m.kelp_ka_sample_id,
-  m.source_if_ka_id,
-  m.source_if_no_ka_id,
-  m.kelp_host,
-  m.kelp_location,
+  NULLIF(btrim(m.kelp_ka_sample_id), '') AS kelp_ka_sample_id,
+  NULLIF(btrim(m.source_if_ka_id), '') AS source_if_ka_id,
+  NULLIF(btrim(m.source_if_no_ka_id), '') AS source_if_no_ka_id,
+  NULLIF(btrim(m.kelp_host), '') AS kelp_host,
+  NULLIF(btrim(m.kelp_location), '') AS kelp_location,
   m.staging_id
 FROM staging.microbes_typed m
 JOIN structured.microbe_isolate mi
   ON mi.staging_id = m.staging_id
-WHERE m.kelp_ka_sample_id IS NOT NULL
-   OR m.source_if_ka_id IS NOT NULL
-   OR m.source_if_no_ka_id IS NOT NULL;
-
--- --------------------------------------------
--- 3) Sanity checks (optional)
--- --------------------------------------------
--- SELECT count(*) FROM structured.kelp_sample;
--- SELECT count(*) FROM structured.microbe_isolate;
--- SELECT count(*) FROM structured.microbe_kelp_link;
+WHERE
+  COALESCE(
+    NULLIF(btrim(m.kelp_ka_sample_id), ''),
+    NULLIF(btrim(m.source_if_ka_id), ''),
+    NULLIF(btrim(m.source_if_no_ka_id), '')
+  ) IS NOT NULL;
 
 COMMIT;
