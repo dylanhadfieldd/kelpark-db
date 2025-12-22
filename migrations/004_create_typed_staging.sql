@@ -1,121 +1,44 @@
 -- 004_create_typed_staging.sql
 -- Purpose:
---   Create typed staging tables from staging.*_raw, normalizing placeholders
+--   Create "typed" staging tables from staging.*_raw, normalizing placeholders
 --   (NA, None, Not_Yet_Assessed, TBD, empty) to NULL, and casting where safe.
 --
--- Key fix vs prior version:
---   - Safe numeric parsing no longer produces invalid casts like "12-"
---   - Values like "12-Oct" (Excel auto-date style) will parse to 12 (first numeric token)
+-- Key fixes included in this version:
+--   1) staging_id is UUID (matches staging.*_raw). typed_id remains BIGSERIAL.
+--   2) Safe numeric parsing: avoids errors like invalid numeric "12-" or similar.
+--   3) Temperature "12-Oct" issue: interpreted as Excel date-like artifact and mapped to 12 (°C).
+--      (We do this ONLY for storage_details_temperature_c; we do NOT coerce other fields this way.)
 --
 -- Assumptions:
 --   - Raw tables exist: staging.kelps_raw, staging.microbes_raw
---   - staging.kelps_raw and staging.microbes_raw include the referenced columns
+--   - Raw columns are TEXT (or at least can be trimmed/coalesced); staging_id is UUID in raw.
+--
+-- Notes:
+--   - We DROP + RECREATE typed tables (idempotent).
+--   - We keep *_raw copies for important fields (lat/long, dates, numerics).
+--   - Conservative casting: ambiguous stays TEXT.
+--
+-- Run:
+--   psql -f 004_create_typed_staging.sql
 
 BEGIN;
 
 CREATE SCHEMA IF NOT EXISTS staging;
 
--- ============================================================
--- TEMP helper functions (session-scoped; no persistent objects)
--- ============================================================
-
--- Normalize placeholders to NULL and trim whitespace
-CREATE OR REPLACE FUNCTION pg_temp.norm_text(p_text text)
-RETURNS text
-LANGUAGE sql
-AS $$
-  SELECT CASE
-    WHEN p_text IS NULL THEN NULL
-    WHEN btrim(p_text) = '' THEN NULL
-    WHEN lower(btrim(p_text)) IN (
-      'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed'
-    ) THEN NULL
-    ELSE btrim(p_text)
-  END;
-$$;
-
--- Extract first numeric token from a string and cast to numeric
--- Examples:
---   '10'      -> 10
---   '10 C'    -> 10
---   '12-Oct'  -> 12     (fixes your current issue)
---   '12-'     -> 12     (safe)
---   '--'      -> NULL
-CREATE OR REPLACE FUNCTION pg_temp.safe_numeric(p_text text)
-RETURNS numeric
-LANGUAGE sql
-AS $$
-  SELECT CASE
-    WHEN pg_temp.norm_text(p_text) IS NULL THEN NULL
-    ELSE (
-      SELECT (regexp_match(pg_temp.norm_text(p_text), '(-?\d+(?:\.\d+)?)'))[1]::numeric
-    )
-  END;
-$$;
-
--- Extract first integer token and cast to int
-CREATE OR REPLACE FUNCTION pg_temp.safe_int(p_text text)
-RETURNS integer
-LANGUAGE sql
-AS $$
-  SELECT CASE
-    WHEN pg_temp.norm_text(p_text) IS NULL THEN NULL
-    ELSE (
-      SELECT (regexp_match(pg_temp.norm_text(p_text), '(\d+)'))[1]::int
-    )
-  END;
-$$;
-
--- Best-effort boolean parsing
-CREATE OR REPLACE FUNCTION pg_temp.safe_bool(p_text text)
-RETURNS boolean
-LANGUAGE sql
-AS $$
-  SELECT CASE
-    WHEN pg_temp.norm_text(p_text) IS NULL THEN NULL
-    WHEN lower(pg_temp.norm_text(p_text)) IN ('yes','true','1','y','t') THEN true
-    WHEN lower(pg_temp.norm_text(p_text)) IN ('no','false','0','n','f') THEN false
-    ELSE NULL
-  END;
-$$;
-
--- Best-effort date parsing (keeps NULL on failure)
--- Supports:
---   YYYY-MM-DD
---   DD-Mon-YY / DD-Mon-YYYY
---   MM/DD/YYYY
-CREATE OR REPLACE FUNCTION pg_temp.safe_date(p_text text)
-RETURNS date
-LANGUAGE sql
-AS $$
-  SELECT CASE
-    WHEN pg_temp.norm_text(p_text) IS NULL THEN NULL
-    WHEN pg_temp.norm_text(p_text) ~ '^\d{4}-\d{2}-\d{2}$'
-      THEN to_date(pg_temp.norm_text(p_text), 'YYYY-MM-DD')
-    WHEN pg_temp.norm_text(p_text) ~ '^\d{1,2}-[A-Za-z]{3}-\d{2}$'
-      THEN to_date(pg_temp.norm_text(p_text), 'DD-Mon-YY')
-    WHEN pg_temp.norm_text(p_text) ~ '^\d{1,2}-[A-Za-z]{3}-\d{4}$'
-      THEN to_date(pg_temp.norm_text(p_text), 'DD-Mon-YYYY')
-    WHEN pg_temp.norm_text(p_text) ~ '^\d{1,2}/\d{1,2}/\d{4}$'
-      THEN to_date(pg_temp.norm_text(p_text), 'MM/DD/YYYY')
-    ELSE NULL
-  END;
-$$;
-
--- ============================================================
+-- =========================
 -- Drop & recreate typed tables
--- ============================================================
+-- =========================
 DROP TABLE IF EXISTS staging.kelps_typed;
 DROP TABLE IF EXISTS staging.microbes_typed;
 
--- ============================================================
+-- =========================
 -- KELPS_TYPED
--- ============================================================
+-- =========================
 CREATE TABLE staging.kelps_typed (
   typed_id          BIGSERIAL PRIMARY KEY,
 
   -- Ingest metadata carried forward
-  staging_id        BIGINT NOT NULL,
+  staging_id        UUID NOT NULL,
   ingest_batch_id   UUID NULL,
   source_filename   TEXT NULL,
   source_row_num    INTEGER NULL,
@@ -133,7 +56,7 @@ CREATE TABLE staging.kelps_typed (
   storage_details_rack_id      TEXT NULL,
   storage_details_location     TEXT NULL,
   storage_details_temperature_c_raw TEXT NULL,
-  storage_details_temperature_c_num NUMERIC NULL,
+  storage_details_temperature_c_num NUMERIC NULL,   -- best-effort numeric extraction
   storage_details_medium       TEXT NULL,
 
   -- Sampling metadata
@@ -272,9 +195,151 @@ CREATE TABLE staging.kelps_typed (
   commercial_supply_logistics_carbon_footprint_transport_num NUMERIC NULL
 );
 
-INSERT INTO staging.kelps_typed
+-- Insert transformed data
+INSERT INTO staging.kelps_typed (
+  staging_id,
+  ingest_batch_id,
+  source_filename,
+  source_row_num,
+  loaded_at,
+
+  taxonomy_genus,
+  taxonomy_species,
+  taxonomy_sex,
+  taxonomy_variety_or_form,
+
+  storage_details_id,
+  storage_details_position_id,
+  storage_details_rack_id,
+  storage_details_location,
+  storage_details_temperature_c_raw,
+  storage_details_temperature_c_num,
+  storage_details_medium,
+
+  sampling_metadata_country,
+  sampling_metadata_latitude_raw,
+  sampling_metadata_longitude_raw,
+  sampling_metadata_latitude_num,
+  sampling_metadata_longitude_num,
+  sampling_metadata_collection_date_raw,
+  sampling_metadata_collection_date,
+  sampling_metadata_personnel_collected,
+  sampling_metadata_isolation_date_raw,
+  sampling_metadata_isolation_date,
+  sampling_metadata_deposit_date_raw,
+  sampling_metadata_deposit_date,
+  sampling_metadata_deposited_by,
+  sampling_metadata_permit,
+  sampling_metadata_collection_site,
+
+  other_previously_housed_location,
+  sponsorship_strain_sponsorship_status,
+  sponsorship_code,
+
+  phenotypic_data_growth_rate_raw,
+  phenotypic_data_growth_rate_num,
+  phenotypic_data_optimal_growth_conditions,
+  phenotypic_data_percent_viability_raw,
+  phenotypic_data_percent_viability_num,
+  phenotypic_data_lifespan,
+  phenotypic_data_tolerance_to_thermal_stressor,
+  phenotypic_data_tolerance_to_water_quality_stressors,
+
+  inaturalist,
+  ecological_role_primary_producer,
+  ecological_role_carbon_sink,
+  ecological_role_habitat_former,
+
+  metabolic_pathways_kegg_pathway_id,
+  metabolic_pathways_metacyc_pathway_id,
+  functional_annotation_gene_function_id,
+  functional_annotation_protein_function_id,
+
+  genetic_variation_data_variant_id,
+  genetic_variation_data_gene_id,
+  genetic_variation_data_chromosome,
+  genetic_variation_data_reference_allele,
+  genetic_variation_data_alternate_allele,
+  genetic_variation_data_variant_type,
+  genetic_variation_data_allele_frequency_raw,
+  genetic_variation_data_allele_frequency_num,
+  genetic_variation_data_read_depth_raw,
+  genetic_variation_data_read_depth_num,
+  genetic_variation_data_quality_score_raw,
+  genetic_variation_data_quality_score_num,
+  genetic_variation_data_genotype,
+
+  genetic_diversity_fst_raw,
+  genetic_diversity_fst_num,
+  genetic_diversity_observed_heterozygosity_raw,
+  genetic_diversity_observed_heterozygosity_num,
+  genetic_diversity_observed_homozygosity_raw,
+  genetic_diversity_observed_homozygosity_num,
+  genetic_diversity_allele_count_raw,
+  genetic_diversity_allele_count_num,
+  genetic_diversity_nucleotide_diversity_raw,
+  genetic_diversity_nucleotide_diversity_num,
+
+  phenotypic_diversity_trait_id_name,
+  phenotypic_diversity_trait_variance_raw,
+  phenotypic_diversity_trait_variance_num,
+  phenotypic_diversity_trait_mean_raw,
+  phenotypic_diversity_trait_mean_num,
+  phenotypic_diversity_trait_standard_deviation_raw,
+  phenotypic_diversity_trait_standard_deviation_num,
+  phenotypic_diversity_trait_range,
+
+  iucn_red_list_extinct_ex,
+  iucn_red_list_extinct_in_the_wild_ew,
+  iucn_red_list_critically_endangered_cr,
+  iucn_red_list_endangered_en,
+  iucn_red_list_vulnerable_vu,
+  iucn_red_list_least_concern,
+  iucn_red_list_data_deficient_dd,
+  iucn_red_list_not_evaluated_ne,
+
+  ecosystem_endemic,
+  ecosystem_naturalized,
+  ecosystem_invasive,
+  ecosystem_adventive,
+  ecosystem_extirpated,
+  ecosystem_weed,
+  ecosystem_cultivated_horticultural,
+  ecosystem_ruderal,
+  ecosystem_pioneer,
+
+  commercial_bio_variables_harvestable_yield_per_cycle_raw,
+  commercial_bio_variables_harvestable_yield_per_cycle_num,
+  commercial_bio_variables_harvest_season,
+  commercial_bio_variables_light_needed,
+  commercial_production_spoilage_rate_raw,
+  commercial_production_spoilage_rate_num,
+  commercial_production_operational_cost_per_cycle_raw,
+  commercial_production_operational_cost_per_cycle_num,
+  commercial_production_gross_margin_raw,
+  commercial_production_gross_margin_num,
+  commercial_market_price_volatility_index_raw,
+  commercial_market_price_volatility_index_num,
+  commercial_market_demand_index_sector,
+  commercial_market_market_growth_rate_raw,
+  commercial_market_market_growth_rate_num,
+  commercial_processing_moisture_content_raw,
+  commercial_processing_moisture_content_num,
+  commercial_processing_protein_content_raw,
+  commercial_processing_protein_content_num,
+  commercial_processing_alginate_or_carrageenan_content_raw,
+  commercial_processing_alginate_or_carrageenan_content_num,
+  commercial_processing_contaminants,
+  commercial_processing_shelf_life,
+  commercial_processing_grade_quality_score_raw,
+  commercial_processing_grade_quality_score_num,
+  commercial_supply_logistics_transport_cost_raw,
+  commercial_supply_logistics_transport_cost_num,
+  commercial_supply_logistics_distribution_channel,
+  commercial_supply_logistics_carbon_footprint_transport_raw,
+  commercial_supply_logistics_carbon_footprint_transport_num
+)
 SELECT
-  -- Ingest metadata
   k.staging_id,
   k.ingest_batch_id,
   k.source_filename,
@@ -282,176 +347,514 @@ SELECT
   k.loaded_at,
 
   -- Taxonomy
-  pg_temp.norm_text(k.taxonomy_genus),
-  pg_temp.norm_text(k.taxonomy_species),
-  pg_temp.norm_text(k.taxonomy_sex),
-  pg_temp.norm_text(k.taxonomy_variety_or_form),
+  NULLIF(trim(k.taxonomy_genus), '')::text,
+  NULLIF(trim(k.taxonomy_species), '')::text,
+  CASE
+    WHEN lower(trim(coalesce(k.taxonomy_sex,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE trim(k.taxonomy_sex)
+  END,
+  CASE
+    WHEN lower(trim(coalesce(k.taxonomy_variety_or_form,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE trim(k.taxonomy_variety_or_form)
+  END,
 
-  -- Storage
-  pg_temp.norm_text(k.storage_details_id),
-  pg_temp.norm_text(k.storage_details_position_id),
-  pg_temp.norm_text(k.storage_details_rack_id),
-  pg_temp.norm_text(k.storage_details_location),
-  pg_temp.norm_text(k.storage_details_temperature_c),
-  pg_temp.safe_numeric(k.storage_details_temperature_c),
-  pg_temp.norm_text(k.storage_details_medium),
+  -- Storage ids
+  CASE WHEN lower(trim(coalesce(k.storage_details_id,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.storage_details_id) END,
+  CASE WHEN lower(trim(coalesce(k.storage_details_position_id,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.storage_details_position_id) END,
+  CASE WHEN lower(trim(coalesce(k.storage_details_rack_id,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.storage_details_rack_id) END,
+  CASE WHEN lower(trim(coalesce(k.storage_details_location,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.storage_details_location) END,
+
+  -- Temperature raw
+  CASE WHEN lower(trim(coalesce(k.storage_details_temperature_c,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.storage_details_temperature_c) END,
+
+  -- Temperature numeric (safe):
+  --   - If value is plain number -> parse
+  --   - If value looks like Excel date such as '12-Oct' -> take leading day (12)
+  --   - If cleaned numeric ends with '-' or is just '-' etc -> NULL
+  CASE
+    WHEN lower(trim(coalesce(k.storage_details_temperature_c,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    WHEN trim(k.storage_details_temperature_c) ~ '^\s*-?\d+(\.\d+)?\s*$'
+      THEN trim(k.storage_details_temperature_c)::numeric
+    WHEN trim(k.storage_details_temperature_c) ~ '^\s*\d{1,2}-[A-Za-z]{3}\s*$'
+      THEN (regexp_match(trim(k.storage_details_temperature_c), '^\s*(\d{1,2})-'))[1]::numeric
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.storage_details_temperature_c), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.storage_details_temperature_c), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.storage_details_temperature_c), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.storage_details_temperature_c), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+
+  CASE WHEN lower(trim(coalesce(k.storage_details_medium,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.storage_details_medium) END,
 
   -- Sampling metadata
-  pg_temp.norm_text(k.sampling_metadata_country),
-  pg_temp.norm_text(k.sampling_metadata_latitude),
-  pg_temp.norm_text(k.sampling_metadata_longitude),
+  CASE WHEN lower(trim(coalesce(k.sampling_metadata_country,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.sampling_metadata_country) END,
+  CASE WHEN lower(trim(coalesce(k.sampling_metadata_latitude,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.sampling_metadata_latitude) END,
+  CASE WHEN lower(trim(coalesce(k.sampling_metadata_longitude,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.sampling_metadata_longitude) END,
+
   CASE
-    WHEN pg_temp.norm_text(k.sampling_metadata_latitude) ~ '^\s*-?\d+(\.\d+)?\s*$'
-      THEN pg_temp.safe_numeric(k.sampling_metadata_latitude)
+    WHEN k.sampling_metadata_latitude ~ '^\s*-?\d+(\.\d+)?\s*$' THEN trim(k.sampling_metadata_latitude)::numeric
     ELSE NULL
   END,
   CASE
-    WHEN pg_temp.norm_text(k.sampling_metadata_longitude) ~ '^\s*-?\d+(\.\d+)?\s*$'
-      THEN pg_temp.safe_numeric(k.sampling_metadata_longitude)
+    WHEN k.sampling_metadata_longitude ~ '^\s*-?\d+(\.\d+)?\s*$' THEN trim(k.sampling_metadata_longitude)::numeric
     ELSE NULL
   END,
-  pg_temp.norm_text(k.sampling_metadata_collection_date),
-  pg_temp.safe_date(k.sampling_metadata_collection_date),
-  pg_temp.norm_text(k.sampling_metadata_personnel_collected),
-  pg_temp.norm_text(k.sampling_metadata_isolation_date),
-  pg_temp.safe_date(k.sampling_metadata_isolation_date),
-  pg_temp.norm_text(k.sampling_metadata_deposit_date),
-  pg_temp.safe_date(k.sampling_metadata_deposit_date),
-  pg_temp.norm_text(k.sampling_metadata_deposited_by),
-  pg_temp.norm_text(k.sampling_metadata_permit),
-  pg_temp.norm_text(k.sampling_metadata_collection_site),
+
+  CASE WHEN lower(trim(coalesce(k.sampling_metadata_collection_date,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.sampling_metadata_collection_date) END,
+  CASE
+    WHEN lower(trim(coalesce(k.sampling_metadata_collection_date,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    WHEN trim(k.sampling_metadata_collection_date) ~ '^\d{1,2}-[A-Za-z]{3}-\d{2,4}$'
+      THEN to_date(trim(k.sampling_metadata_collection_date), CASE WHEN length(trim(k.sampling_metadata_collection_date)) = 9 THEN 'DD-Mon-YY' ELSE 'DD-Mon-YYYY' END)
+    WHEN trim(k.sampling_metadata_collection_date) ~ '^\d{1,2}/\d{1,2}/\d{4}$'
+      THEN to_date(trim(k.sampling_metadata_collection_date), 'MM/DD/YYYY')
+    ELSE NULL
+  END,
+
+  CASE WHEN lower(trim(coalesce(k.sampling_metadata_personnel_collected,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.sampling_metadata_personnel_collected) END,
+
+  CASE WHEN lower(trim(coalesce(k.sampling_metadata_isolation_date,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.sampling_metadata_isolation_date) END,
+  CASE
+    WHEN lower(trim(coalesce(k.sampling_metadata_isolation_date,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    WHEN trim(k.sampling_metadata_isolation_date) ~ '^\d{1,2}-[A-Za-z]{3}-\d{2,4}$'
+      THEN to_date(trim(k.sampling_metadata_isolation_date), CASE WHEN length(trim(k.sampling_metadata_isolation_date)) = 9 THEN 'DD-Mon-YY' ELSE 'DD-Mon-YYYY' END)
+    WHEN trim(k.sampling_metadata_isolation_date) ~ '^\d{1,2}/\d{1,2}/\d{4}$'
+      THEN to_date(trim(k.sampling_metadata_isolation_date), 'MM/DD/YYYY')
+    ELSE NULL
+  END,
+
+  CASE WHEN lower(trim(coalesce(k.sampling_metadata_deposit_date,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.sampling_metadata_deposit_date) END,
+  CASE
+    WHEN lower(trim(coalesce(k.sampling_metadata_deposit_date,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    WHEN trim(k.sampling_metadata_deposit_date) ~ '^\d{1,2}-[A-Za-z]{3}-\d{2,4}$'
+      THEN to_date(trim(k.sampling_metadata_deposit_date), CASE WHEN length(trim(k.sampling_metadata_deposit_date)) = 9 THEN 'DD-Mon-YY' ELSE 'DD-Mon-YYYY' END)
+    WHEN trim(k.sampling_metadata_deposit_date) ~ '^\d{1,2}/\d{1,2}/\d{4}$'
+      THEN to_date(trim(k.sampling_metadata_deposit_date), 'MM/DD/YYYY')
+    ELSE NULL
+  END,
+
+  CASE WHEN lower(trim(coalesce(k.sampling_metadata_deposited_by,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.sampling_metadata_deposited_by) END,
+  CASE WHEN lower(trim(coalesce(k.sampling_metadata_permit,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.sampling_metadata_permit) END,
+  CASE WHEN lower(trim(coalesce(k.sampling_metadata_collection_site,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.sampling_metadata_collection_site) END,
 
   -- Misc provenance
-  pg_temp.norm_text(k.other_previously_housed_location),
-  pg_temp.norm_text(k.sponsorship_strain_sponsorship_status),
-  pg_temp.norm_text(k.sponsorship_code),
+  CASE WHEN lower(trim(coalesce(k.other_previously_housed_location,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.other_previously_housed_location) END,
+  CASE WHEN lower(trim(coalesce(k.sponsorship_strain_sponsorship_status,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.sponsorship_strain_sponsorship_status) END,
+  CASE WHEN lower(trim(coalesce(k.sponsorship_code,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.sponsorship_code) END,
 
-  -- Phenotypic
-  pg_temp.norm_text(k.phenotypic_data_growth_rate),
-  pg_temp.safe_numeric(k.phenotypic_data_growth_rate),
-  pg_temp.norm_text(k.phenotypic_data_optimal_growth_conditions),
-  pg_temp.norm_text(k.phenotypic_data_percent_viability),
-  pg_temp.safe_numeric(k.phenotypic_data_percent_viability),
-  pg_temp.norm_text(k.phenotypic_data_lifespan),
-  pg_temp.norm_text(k.phenotypic_data_tolerance_to_thermal_stressor),
-  pg_temp.norm_text(k.phenotypic_data_tolerance_to_water_quality_stressors),
+  -- Phenotypic growth rate
+  CASE WHEN lower(trim(coalesce(k.phenotypic_data_growth_rate,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.phenotypic_data_growth_rate) END,
+  CASE
+    WHEN lower(trim(coalesce(k.phenotypic_data_growth_rate,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.phenotypic_data_growth_rate), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.phenotypic_data_growth_rate), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.phenotypic_data_growth_rate), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.phenotypic_data_growth_rate), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
 
-  -- Links / annotations
-  pg_temp.norm_text(k.inaturalist),
+  CASE WHEN lower(trim(coalesce(k.phenotypic_data_optimal_growth_conditions,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.phenotypic_data_optimal_growth_conditions) END,
 
-  -- Ecological roles
-  pg_temp.norm_text(k.ecological_role_primary_producer),
-  pg_temp.norm_text(k.ecological_role_carbon_sink),
-  pg_temp.norm_text(k.ecological_role_habitat_former),
+  CASE WHEN lower(trim(coalesce(k.phenotypic_data_percent_viability,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.phenotypic_data_percent_viability) END,
+  CASE
+    WHEN lower(trim(coalesce(k.phenotypic_data_percent_viability,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.phenotypic_data_percent_viability), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.phenotypic_data_percent_viability), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.phenotypic_data_percent_viability), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.phenotypic_data_percent_viability), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
 
-  -- Pathways / annotation ids
-  pg_temp.norm_text(k.metabolic_pathways_kegg_pathway_id),
-  pg_temp.norm_text(k.metabolic_pathways_metacyc_pathway_id),
-  pg_temp.norm_text(k.functional_annotation_gene_function_id),
-  pg_temp.norm_text(k.functional_annotation_protein_function_id),
+  CASE WHEN lower(trim(coalesce(k.phenotypic_data_lifespan,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.phenotypic_data_lifespan) END,
+  CASE WHEN lower(trim(coalesce(k.phenotypic_data_tolerance_to_thermal_stressor,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.phenotypic_data_tolerance_to_thermal_stressor) END,
+  CASE WHEN lower(trim(coalesce(k.phenotypic_data_tolerance_to_water_quality_stressors,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.phenotypic_data_tolerance_to_water_quality_stressors) END,
+
+  -- Links / ecology
+  CASE WHEN lower(trim(coalesce(k.inaturalist,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.inaturalist) END,
+  CASE WHEN lower(trim(coalesce(k.ecological_role_primary_producer,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.ecological_role_primary_producer) END,
+  CASE WHEN lower(trim(coalesce(k.ecological_role_carbon_sink,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.ecological_role_carbon_sink) END,
+  CASE WHEN lower(trim(coalesce(k.ecological_role_habitat_former,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.ecological_role_habitat_former) END,
+
+  -- Pathways / annotations
+  CASE WHEN lower(trim(coalesce(k.metabolic_pathways_kegg_pathway_id,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.metabolic_pathways_kegg_pathway_id) END,
+  CASE WHEN lower(trim(coalesce(k.metabolic_pathways_metacyc_pathway_id,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.metabolic_pathways_metacyc_pathway_id) END,
+  CASE WHEN lower(trim(coalesce(k.functional_annotation_gene_function_id,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.functional_annotation_gene_function_id) END,
+  CASE WHEN lower(trim(coalesce(k.functional_annotation_protein_function_id,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.functional_annotation_protein_function_id) END,
 
   -- Genetic variation
-  pg_temp.norm_text(k.genetic_variation_data_variant_id),
-  pg_temp.norm_text(k.genetic_variation_data_gene_id),
-  pg_temp.norm_text(k.genetic_variation_data_chromosome),
-  pg_temp.norm_text(k.genetic_variation_data_reference_allele),
-  pg_temp.norm_text(k.genetic_variation_data_alternate_allele),
-  pg_temp.norm_text(k.genetic_variation_data_variant_type),
-  pg_temp.norm_text(k.genetic_variation_data_allele_frequency),
-  pg_temp.safe_numeric(k.genetic_variation_data_allele_frequency),
-  pg_temp.norm_text(k.genetic_variation_data_read_depth),
-  pg_temp.safe_numeric(k.genetic_variation_data_read_depth),
-  pg_temp.norm_text(k.genetic_variation_data_quality_score),
-  pg_temp.safe_numeric(k.genetic_variation_data_quality_score),
-  pg_temp.norm_text(k.genetic_variation_data_genotype),
+  CASE WHEN lower(trim(coalesce(k.genetic_variation_data_variant_id,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.genetic_variation_data_variant_id) END,
+  CASE WHEN lower(trim(coalesce(k.genetic_variation_data_gene_id,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.genetic_variation_data_gene_id) END,
+  CASE WHEN lower(trim(coalesce(k.genetic_variation_data_chromosome,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.genetic_variation_data_chromosome) END,
+  CASE WHEN lower(trim(coalesce(k.genetic_variation_data_reference_allele,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.genetic_variation_data_reference_allele) END,
+  CASE WHEN lower(trim(coalesce(k.genetic_variation_data_alternate_allele,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.genetic_variation_data_alternate_allele) END,
+  CASE WHEN lower(trim(coalesce(k.genetic_variation_data_variant_type,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.genetic_variation_data_variant_type) END,
 
-  -- Diversity stats (note: your raw has truncated column names here; keep using what worked for you)
-  pg_temp.norm_text(k.genetic_diversity_within_geography_sample_sets_fst),
-  pg_temp.safe_numeric(k.genetic_diversity_within_geography_sample_sets_fst),
-  pg_temp.norm_text(k.genetic_diversity_within_geography_sample_sets_observed_heteroz),
-  pg_temp.safe_numeric(k.genetic_diversity_within_geography_sample_sets_observed_heteroz),
-  pg_temp.norm_text(k.genetic_diversity_within_geography_sample_sets_observed_homozyg),
-  pg_temp.safe_numeric(k.genetic_diversity_within_geography_sample_sets_observed_homozyg),
-  pg_temp.norm_text(k.genetic_diversity_within_geography_sample_sets_allele_count),
-  pg_temp.safe_numeric(k.genetic_diversity_within_geography_sample_sets_allele_count),
-  pg_temp.norm_text(k.genetic_diversity_within_geography_sample_sets_nucleotide_diver),
-  pg_temp.safe_numeric(k.genetic_diversity_within_geography_sample_sets_nucleotide_diver),
+  CASE WHEN lower(trim(coalesce(k.genetic_variation_data_allele_frequency,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.genetic_variation_data_allele_frequency) END,
+  CASE
+    WHEN lower(trim(coalesce(k.genetic_variation_data_allele_frequency,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.genetic_variation_data_allele_frequency), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.genetic_variation_data_allele_frequency), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.genetic_variation_data_allele_frequency), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.genetic_variation_data_allele_frequency), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
 
-  pg_temp.norm_text(k.phenotypic_diversity_within_geography_sample_sets_trait_id_name),
-  pg_temp.norm_text(k.phenotypic_diversity_within_geography_sample_sets_trait_varianc),
-  pg_temp.safe_numeric(k.phenotypic_diversity_within_geography_sample_sets_trait_varianc),
-  pg_temp.norm_text(k.phenotypic_diversity_within_geography_sample_sets_trait_mean),
-  pg_temp.safe_numeric(k.phenotypic_diversity_within_geography_sample_sets_trait_mean),
-  pg_temp.norm_text(k.phenotypic_diversity_within_geography_sample_sets_trait_standar),
-  pg_temp.safe_numeric(k.phenotypic_diversity_within_geography_sample_sets_trait_standar),
-  pg_temp.norm_text(k.phenotypic_diversity_within_geography_sample_sets_trait_range),
+  CASE WHEN lower(trim(coalesce(k.genetic_variation_data_read_depth,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.genetic_variation_data_read_depth) END,
+  CASE
+    WHEN lower(trim(coalesce(k.genetic_variation_data_read_depth,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.genetic_variation_data_read_depth), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.genetic_variation_data_read_depth), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.genetic_variation_data_read_depth), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.genetic_variation_data_read_depth), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+
+  CASE WHEN lower(trim(coalesce(k.genetic_variation_data_quality_score,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.genetic_variation_data_quality_score) END,
+  CASE
+    WHEN lower(trim(coalesce(k.genetic_variation_data_quality_score,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.genetic_variation_data_quality_score), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.genetic_variation_data_quality_score), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.genetic_variation_data_quality_score), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.genetic_variation_data_quality_score), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+
+  CASE WHEN lower(trim(coalesce(k.genetic_variation_data_genotype,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.genetic_variation_data_genotype) END,
+
+  -- Diversity (NOTE: you may need to update these column names if your raw table truncated them differently)
+  CASE WHEN lower(trim(coalesce(k.genetic_diversity_within_geography_sample_sets_fst,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.genetic_diversity_within_geography_sample_sets_fst) END,
+  CASE
+    WHEN lower(trim(coalesce(k.genetic_diversity_within_geography_sample_sets_fst,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.genetic_diversity_within_geography_sample_sets_fst), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.genetic_diversity_within_geography_sample_sets_fst), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.genetic_diversity_within_geography_sample_sets_fst), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.genetic_diversity_within_geography_sample_sets_fst), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+
+  CASE WHEN lower(trim(coalesce(k.genetic_diversity_within_geography_sample_sets_observed_heteroz,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.genetic_diversity_within_geography_sample_sets_observed_heteroz) END,
+  CASE
+    WHEN lower(trim(coalesce(k.genetic_diversity_within_geography_sample_sets_observed_heteroz,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.genetic_diversity_within_geography_sample_sets_observed_heteroz), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.genetic_diversity_within_geography_sample_sets_observed_heteroz), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.genetic_diversity_within_geography_sample_sets_observed_heteroz), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.genetic_diversity_within_geography_sample_sets_observed_heteroz), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+
+  CASE WHEN lower(trim(coalesce(k.genetic_diversity_within_geography_sample_sets_observed_homozyg,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.genetic_diversity_within_geography_sample_sets_observed_homozyg) END,
+  CASE
+    WHEN lower(trim(coalesce(k.genetic_diversity_within_geography_sample_sets_observed_homozyg,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.genetic_diversity_within_geography_sample_sets_observed_homozyg), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.genetic_diversity_within_geography_sample_sets_observed_homozyg), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.genetic_diversity_within_geography_sample_sets_observed_homozyg), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.genetic_diversity_within_geography_sample_sets_observed_homozyg), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+
+  CASE WHEN lower(trim(coalesce(k.genetic_diversity_within_geography_sample_sets_allele_count,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.genetic_diversity_within_geography_sample_sets_allele_count) END,
+  CASE
+    WHEN lower(trim(coalesce(k.genetic_diversity_within_geography_sample_sets_allele_count,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.genetic_diversity_within_geography_sample_sets_allele_count), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.genetic_diversity_within_geography_sample_sets_allele_count), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.genetic_diversity_within_geography_sample_sets_allele_count), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.genetic_diversity_within_geography_sample_sets_allele_count), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+
+  CASE WHEN lower(trim(coalesce(k.genetic_diversity_within_geography_sample_sets_nucleotide_diver,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.genetic_diversity_within_geography_sample_sets_nucleotide_diver) END,
+  CASE
+    WHEN lower(trim(coalesce(k.genetic_diversity_within_geography_sample_sets_nucleotide_diver,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.genetic_diversity_within_geography_sample_sets_nucleotide_diver), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.genetic_diversity_within_geography_sample_sets_nucleotide_diver), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.genetic_diversity_within_geography_sample_sets_nucleotide_diver), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.genetic_diversity_within_geography_sample_sets_nucleotide_diver), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+
+  -- Phenotypic diversity
+  CASE WHEN lower(trim(coalesce(k.phenotypic_diversity_within_geography_sample_sets_trait_id_name,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.phenotypic_diversity_within_geography_sample_sets_trait_id_name) END,
+
+  CASE WHEN lower(trim(coalesce(k.phenotypic_diversity_within_geography_sample_sets_trait_varianc,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.phenotypic_diversity_within_geography_sample_sets_trait_varianc) END,
+  CASE
+    WHEN lower(trim(coalesce(k.phenotypic_diversity_within_geography_sample_sets_trait_varianc,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.phenotypic_diversity_within_geography_sample_sets_trait_varianc), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.phenotypic_diversity_within_geography_sample_sets_trait_varianc), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.phenotypic_diversity_within_geography_sample_sets_trait_varianc), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.phenotypic_diversity_within_geography_sample_sets_trait_varianc), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+
+  CASE WHEN lower(trim(coalesce(k.phenotypic_diversity_within_geography_sample_sets_trait_mean,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.phenotypic_diversity_within_geography_sample_sets_trait_mean) END,
+  CASE
+    WHEN lower(trim(coalesce(k.phenotypic_diversity_within_geography_sample_sets_trait_mean,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.phenotypic_diversity_within_geography_sample_sets_trait_mean), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.phenotypic_diversity_within_geography_sample_sets_trait_mean), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.phenotypic_diversity_within_geography_sample_sets_trait_mean), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.phenotypic_diversity_within_geography_sample_sets_trait_mean), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+
+  CASE WHEN lower(trim(coalesce(k.phenotypic_diversity_within_geography_sample_sets_trait_standar,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.phenotypic_diversity_within_geography_sample_sets_trait_standar) END,
+  CASE
+    WHEN lower(trim(coalesce(k.phenotypic_diversity_within_geography_sample_sets_trait_standar,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.phenotypic_diversity_within_geography_sample_sets_trait_standar), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.phenotypic_diversity_within_geography_sample_sets_trait_standar), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.phenotypic_diversity_within_geography_sample_sets_trait_standar), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.phenotypic_diversity_within_geography_sample_sets_trait_standar), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+
+  CASE WHEN lower(trim(coalesce(k.phenotypic_diversity_within_geography_sample_sets_trait_range,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.phenotypic_diversity_within_geography_sample_sets_trait_range) END,
 
   -- IUCN flags
-  pg_temp.safe_bool(k.iucn_red_list_extinct_ex),
-  pg_temp.safe_bool(k.iucn_red_list_extinct_in_the_wild_ew),
-  pg_temp.safe_bool(k.iucn_red_list_critically_endangered_cr),
-  pg_temp.safe_bool(k.iucn_red_list_endangered_en),
-  pg_temp.safe_bool(k.iucn_red_list_vulnerable_vu),
-  pg_temp.safe_bool(k.iucn_red_list_least_concern),
-  pg_temp.safe_bool(k.iucn_red_list_data_deficient_dd),
-  pg_temp.safe_bool(k.iucn_red_list_not_evaluated_ne),
+  CASE WHEN lower(trim(coalesce(k.iucn_red_list_extinct_ex,''))) IN ('yes','true','1') THEN true
+       WHEN lower(trim(coalesce(k.iucn_red_list_extinct_ex,''))) IN ('no','false','0') THEN false
+       ELSE NULL END,
+  CASE WHEN lower(trim(coalesce(k.iucn_red_list_extinct_in_the_wild_ew,''))) IN ('yes','true','1') THEN true
+       WHEN lower(trim(coalesce(k.iucn_red_list_extinct_in_the_wild_ew,''))) IN ('no','false','0') THEN false
+       ELSE NULL END,
+  CASE WHEN lower(trim(coalesce(k.iucn_red_list_critically_endangered_cr,''))) IN ('yes','true','1') THEN true
+       WHEN lower(trim(coalesce(k.iucn_red_list_critically_endangered_cr,''))) IN ('no','false','0') THEN false
+       ELSE NULL END,
+  CASE WHEN lower(trim(coalesce(k.iucn_red_list_endangered_en,''))) IN ('yes','true','1') THEN true
+       WHEN lower(trim(coalesce(k.iucn_red_list_endangered_en,''))) IN ('no','false','0') THEN false
+       ELSE NULL END,
+  CASE WHEN lower(trim(coalesce(k.iucn_red_list_vulnerable_vu,''))) IN ('yes','true','1') THEN true
+       WHEN lower(trim(coalesce(k.iucn_red_list_vulnerable_vu,''))) IN ('no','false','0') THEN false
+       ELSE NULL END,
+  CASE WHEN lower(trim(coalesce(k.iucn_red_list_least_concern,''))) IN ('yes','true','1') THEN true
+       WHEN lower(trim(coalesce(k.iucn_red_list_least_concern,''))) IN ('no','false','0') THEN false
+       ELSE NULL END,
+  CASE WHEN lower(trim(coalesce(k.iucn_red_list_data_deficient_dd,''))) IN ('yes','true','1') THEN true
+       WHEN lower(trim(coalesce(k.iucn_red_list_data_deficient_dd,''))) IN ('no','false','0') THEN false
+       ELSE NULL END,
+  CASE WHEN lower(trim(coalesce(k.iucn_red_list_not_evaluated_ne,''))) IN ('yes','true','1') THEN true
+       WHEN lower(trim(coalesce(k.iucn_red_list_not_evaluated_ne,''))) IN ('no','false','0') THEN false
+       ELSE NULL END,
 
   -- Ecosystem flags
-  pg_temp.safe_bool(k.ecosystem_endemic),
-  pg_temp.safe_bool(k.ecosystem_naturalized),
-  pg_temp.safe_bool(k.ecosystem_invasive),
-  pg_temp.safe_bool(k.ecosystem_adventive),
-  pg_temp.safe_bool(k.ecosystem_extirpated),
-  pg_temp.safe_bool(k.ecosystem_weed),
-  pg_temp.safe_bool(k.ecosystem_cultivated_horticultural),
-  pg_temp.safe_bool(k.ecosystem_ruderal),
-  pg_temp.safe_bool(k.ecosystem_pioneer),
+  CASE WHEN lower(trim(coalesce(k.ecosystem_endemic,''))) IN ('yes','true','1') THEN true
+       WHEN lower(trim(coalesce(k.ecosystem_endemic,''))) IN ('no','false','0') THEN false
+       ELSE NULL END,
+  CASE WHEN lower(trim(coalesce(k.ecosystem_naturalized,''))) IN ('yes','true','1') THEN true
+       WHEN lower(trim(coalesce(k.ecosystem_naturalized,''))) IN ('no','false','0') THEN false
+       ELSE NULL END,
+  CASE WHEN lower(trim(coalesce(k.ecosystem_invasive,''))) IN ('yes','true','1') THEN true
+       WHEN lower(trim(coalesce(k.ecosystem_invasive,''))) IN ('no','false','0') THEN false
+       ELSE NULL END,
+  CASE WHEN lower(trim(coalesce(k.ecosystem_adventive,''))) IN ('yes','true','1') THEN true
+       WHEN lower(trim(coalesce(k.ecosystem_adventive,''))) IN ('no','false','0') THEN false
+       ELSE NULL END,
+  CASE WHEN lower(trim(coalesce(k.ecosystem_extirpated,''))) IN ('yes','true','1') THEN true
+       WHEN lower(trim(coalesce(k.ecosystem_extirpated,''))) IN ('no','false','0') THEN false
+       ELSE NULL END,
+  CASE WHEN lower(trim(coalesce(k.ecosystem_weed,''))) IN ('yes','true','1') THEN true
+       WHEN lower(trim(coalesce(k.ecosystem_weed,''))) IN ('no','false','0') THEN false
+       ELSE NULL END,
+  CASE WHEN lower(trim(coalesce(k.ecosystem_cultivated_horticultural,''))) IN ('yes','true','1') THEN true
+       WHEN lower(trim(coalesce(k.ecosystem_cultivated_horticultural,''))) IN ('no','false','0') THEN false
+       ELSE NULL END,
+  CASE WHEN lower(trim(coalesce(k.ecosystem_ruderal,''))) IN ('yes','true','1') THEN true
+       WHEN lower(trim(coalesce(k.ecosystem_ruderal,''))) IN ('no','false','0') THEN false
+       ELSE NULL END,
+  CASE WHEN lower(trim(coalesce(k.ecosystem_pioneer,''))) IN ('yes','true','1') THEN true
+       WHEN lower(trim(coalesce(k.ecosystem_pioneer,''))) IN ('no','false','0') THEN false
+       ELSE NULL END,
 
-  -- Commercial
-  pg_temp.norm_text(k.commercial_bio_variables_harvestable_yield_per_cycle),
-  pg_temp.safe_numeric(k.commercial_bio_variables_harvestable_yield_per_cycle),
-  pg_temp.norm_text(k.commercial_bio_variables_harvest_season),
-  pg_temp.norm_text(k.commercial_bio_variables_light_needed),
-  pg_temp.norm_text(k.commercial_production_spoilage_rate),
-  pg_temp.safe_numeric(k.commercial_production_spoilage_rate),
-  pg_temp.norm_text(k.commercial_production_operational_cost_per_cycle),
-  pg_temp.safe_numeric(k.commercial_production_operational_cost_per_cycle),
-  pg_temp.norm_text(k.commercial_production_gross_margin),
-  pg_temp.safe_numeric(k.commercial_production_gross_margin),
-  pg_temp.norm_text(k.commercial_market_price_volatility_index),
-  pg_temp.safe_numeric(k.commercial_market_price_volatility_index),
-  pg_temp.norm_text(k.commercial_market_demand_index_sector),
-  pg_temp.norm_text(k.commercial_market_market_growth_rate),
-  pg_temp.safe_numeric(k.commercial_market_market_growth_rate),
-  pg_temp.norm_text(k.commercial_processing_moisture_content),
-  pg_temp.safe_numeric(k.commercial_processing_moisture_content),
-  pg_temp.norm_text(k.commercial_processing_protein_content),
-  pg_temp.safe_numeric(k.commercial_processing_protein_content),
-  pg_temp.norm_text(k.commercial_processing_alginate_or_carrageenan_content),
-  pg_temp.safe_numeric(k.commercial_processing_alginate_or_carrageenan_content),
-  pg_temp.norm_text(k.commercial_processing_contaminants),
-  pg_temp.norm_text(k.commercial_processing_shelf_life),
-  pg_temp.norm_text(k.commercial_processing_grade_quality_score),
-  pg_temp.safe_numeric(k.commercial_processing_grade_quality_score),
-  pg_temp.norm_text(k.commercial_supply_logistics_transport_cost),
-  pg_temp.safe_numeric(k.commercial_supply_logistics_transport_cost),
-  pg_temp.norm_text(k.commercial_supply_logistics_distribution_channel),
-  pg_temp.norm_text(k.commercial_supply_logistics_carbon_footprint_transport),
-  pg_temp.safe_numeric(k.commercial_supply_logistics_carbon_footprint_transport)
+  -- Commercial numerics + texts (safe numeric parsing)
+  CASE WHEN lower(trim(coalesce(k.commercial_bio_variables_harvestable_yield_per_cycle,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.commercial_bio_variables_harvestable_yield_per_cycle) END,
+  CASE
+    WHEN lower(trim(coalesce(k.commercial_bio_variables_harvestable_yield_per_cycle,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.commercial_bio_variables_harvestable_yield_per_cycle), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.commercial_bio_variables_harvestable_yield_per_cycle), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.commercial_bio_variables_harvestable_yield_per_cycle), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.commercial_bio_variables_harvestable_yield_per_cycle), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+  CASE WHEN lower(trim(coalesce(k.commercial_bio_variables_harvest_season,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.commercial_bio_variables_harvest_season) END,
+  CASE WHEN lower(trim(coalesce(k.commercial_bio_variables_light_needed,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.commercial_bio_variables_light_needed) END,
 
+  CASE WHEN lower(trim(coalesce(k.commercial_production_spoilage_rate,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.commercial_production_spoilage_rate) END,
+  CASE
+    WHEN lower(trim(coalesce(k.commercial_production_spoilage_rate,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.commercial_production_spoilage_rate), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.commercial_production_spoilage_rate), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.commercial_production_spoilage_rate), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.commercial_production_spoilage_rate), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+
+  CASE WHEN lower(trim(coalesce(k.commercial_production_operational_cost_per_cycle,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.commercial_production_operational_cost_per_cycle) END,
+  CASE
+    WHEN lower(trim(coalesce(k.commercial_production_operational_cost_per_cycle,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.commercial_production_operational_cost_per_cycle), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.commercial_production_operational_cost_per_cycle), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.commercial_production_operational_cost_per_cycle), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.commercial_production_operational_cost_per_cycle), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+
+  CASE WHEN lower(trim(coalesce(k.commercial_production_gross_margin,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.commercial_production_gross_margin) END,
+  CASE
+    WHEN lower(trim(coalesce(k.commercial_production_gross_margin,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.commercial_production_gross_margin), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.commercial_production_gross_margin), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.commercial_production_gross_margin), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.commercial_production_gross_margin), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+
+  CASE WHEN lower(trim(coalesce(k.commercial_market_price_volatility_index,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.commercial_market_price_volatility_index) END,
+  CASE
+    WHEN lower(trim(coalesce(k.commercial_market_price_volatility_index,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.commercial_market_price_volatility_index), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.commercial_market_price_volatility_index), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.commercial_market_price_volatility_index), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.commercial_market_price_volatility_index), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+
+  CASE WHEN lower(trim(coalesce(k.commercial_market_demand_index_sector,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.commercial_market_demand_index_sector) END,
+
+  CASE WHEN lower(trim(coalesce(k.commercial_market_market_growth_rate,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.commercial_market_market_growth_rate) END,
+  CASE
+    WHEN lower(trim(coalesce(k.commercial_market_market_growth_rate,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.commercial_market_market_growth_rate), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.commercial_market_market_growth_rate), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.commercial_market_market_growth_rate), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.commercial_market_market_growth_rate), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+
+  CASE WHEN lower(trim(coalesce(k.commercial_processing_moisture_content,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.commercial_processing_moisture_content) END,
+  CASE
+    WHEN lower(trim(coalesce(k.commercial_processing_moisture_content,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.commercial_processing_moisture_content), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.commercial_processing_moisture_content), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.commercial_processing_moisture_content), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.commercial_processing_moisture_content), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+
+  CASE WHEN lower(trim(coalesce(k.commercial_processing_protein_content,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.commercial_processing_protein_content) END,
+  CASE
+    WHEN lower(trim(coalesce(k.commercial_processing_protein_content,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.commercial_processing_protein_content), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.commercial_processing_protein_content), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.commercial_processing_protein_content), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.commercial_processing_protein_content), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+
+  CASE WHEN lower(trim(coalesce(k.commercial_processing_alginate_or_carrageenan_content,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.commercial_processing_alginate_or_carrageenan_content) END,
+  CASE
+    WHEN lower(trim(coalesce(k.commercial_processing_alginate_or_carrageenan_content,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.commercial_processing_alginate_or_carrageenan_content), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.commercial_processing_alginate_or_carrageenan_content), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.commercial_processing_alginate_or_carrageenan_content), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.commercial_processing_alginate_or_carrageenan_content), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+
+  CASE WHEN lower(trim(coalesce(k.commercial_processing_contaminants,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.commercial_processing_contaminants) END,
+  CASE WHEN lower(trim(coalesce(k.commercial_processing_shelf_life,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.commercial_processing_shelf_life) END,
+
+  CASE WHEN lower(trim(coalesce(k.commercial_processing_grade_quality_score,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.commercial_processing_grade_quality_score) END,
+  CASE
+    WHEN lower(trim(coalesce(k.commercial_processing_grade_quality_score,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.commercial_processing_grade_quality_score), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.commercial_processing_grade_quality_score), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.commercial_processing_grade_quality_score), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.commercial_processing_grade_quality_score), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+
+  CASE WHEN lower(trim(coalesce(k.commercial_supply_logistics_transport_cost,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.commercial_supply_logistics_transport_cost) END,
+  CASE
+    WHEN lower(trim(coalesce(k.commercial_supply_logistics_transport_cost,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.commercial_supply_logistics_transport_cost), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.commercial_supply_logistics_transport_cost), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.commercial_supply_logistics_transport_cost), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.commercial_supply_logistics_transport_cost), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+
+  CASE WHEN lower(trim(coalesce(k.commercial_supply_logistics_distribution_channel,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.commercial_supply_logistics_distribution_channel) END,
+
+  CASE WHEN lower(trim(coalesce(k.commercial_supply_logistics_carbon_footprint_transport,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(k.commercial_supply_logistics_carbon_footprint_transport) END,
+  CASE
+    WHEN lower(trim(coalesce(k.commercial_supply_logistics_carbon_footprint_transport,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(k.commercial_supply_logistics_carbon_footprint_transport), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(k.commercial_supply_logistics_carbon_footprint_transport), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(k.commercial_supply_logistics_carbon_footprint_transport), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(k.commercial_supply_logistics_carbon_footprint_transport), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END
 FROM staging.kelps_raw k;
 
 CREATE INDEX IF NOT EXISTS idx_kelps_typed_batch ON staging.kelps_typed (ingest_batch_id);
 CREATE INDEX IF NOT EXISTS idx_kelps_typed_storage_id ON staging.kelps_typed (storage_details_id);
 CREATE INDEX IF NOT EXISTS idx_kelps_typed_taxon ON staging.kelps_typed (taxonomy_genus, taxonomy_species);
 
--- ============================================================
+-- =========================
 -- MICROBES_TYPED
--- ============================================================
+-- =========================
 CREATE TABLE staging.microbes_typed (
   typed_id          BIGSERIAL PRIMARY KEY,
 
-  staging_id        BIGINT NOT NULL,
+  staging_id        UUID NOT NULL,
   ingest_batch_id   UUID NULL,
   source_filename   TEXT NULL,
   source_row_num    INTEGER NULL,
@@ -539,93 +942,182 @@ CREATE TABLE staging.microbes_typed (
   probiotic_known_host TEXT NULL
 );
 
-INSERT INTO staging.microbes_typed
+INSERT INTO staging.microbes_typed (
+  staging_id, ingest_batch_id, source_filename, source_row_num, loaded_at,
+  microbe_id, original_code, institution_isolation_physically_conducted, isolated_year,
+  isolated_by, maintained_by, maintained_at,
+  kelp_host, kelp_ka_sample_id, source_if_ka_id, source_if_no_ka_id, kelp_location,
+  kelp_collection_temp_raw, kelp_collection_temp_num, kelp_collection_month, kelp_collection_season,
+  kelp_thallus_collection, kelp_collection_approach, kelp_collection_method,
+  microbe_isolation_methods, microbe_isolation_protocol, isolation_media,
+  location_stored1, location_1_temperature, location_stored2, location_2_temperature,
+  cryopreservation_date_raw, cryopreservation_date, cryo_storage_medium, cryo_storage_preservative,
+  cryo_revival_tested, cryo_backups_created, cryopreservation_protocol,
+  malditof_procedure, malditof_dataanalysis_complete, high_quality_malditof_data,
+  s16_pcr_completed, pcr_conducted_by, sanger_sequencing_completed, sequencing_date_raw, sequencing_date,
+  primers_used, sequencing_notes, sequencing_conducted_by,
+  total_bp_length_after_trimming, closest_ncbi_blast_tax_id, ncbi_blast_query_cover, percent_identity,
+  accession, taxonomy_kingdom, s16_sequence, its2_sequence,
+  pathogen_activity_kelp, pathogen_activity_humans, pathogen_activity_plants, pathogen_activity_animals,
+  growth_temperature_c_range, growth_salinity_range, growth_ph_range, growth_optimal_media,
+  morphology_colony_color, morphology_colony_size, morphology_colony_shape, morphology_colony_texture,
+  gram_stain, morphology_cell_shape, probiotic_activity, probiotic_known_host
+)
 SELECT
   m.staging_id, m.ingest_batch_id, m.source_filename, m.source_row_num, m.loaded_at,
 
-  pg_temp.norm_text(m.microbe_id),
-  pg_temp.norm_text(m.original_code),
-  pg_temp.norm_text(m.institution_isolation_physically_conducted),
-  pg_temp.safe_int(m.isolated_year),
+  CASE WHEN lower(trim(coalesce(m.microbe_id,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.microbe_id) END,
+  CASE WHEN lower(trim(coalesce(m.original_code,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.original_code) END,
+  CASE WHEN lower(trim(coalesce(m.institution_isolation_physically_conducted,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.institution_isolation_physically_conducted) END,
 
-  pg_temp.norm_text(m.isolated_by),
-  pg_temp.norm_text(m.maintained_by),
-  pg_temp.norm_text(m.maintained_at),
+  CASE
+    WHEN lower(trim(coalesce(m.isolated_year,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    WHEN trim(m.isolated_year) ~ '^\d{4}$' THEN trim(m.isolated_year)::int
+    ELSE NULL
+  END,
 
-  pg_temp.norm_text(m.kelp_host),
-  pg_temp.norm_text(m.kelp_ka_sample_id),
-  pg_temp.norm_text(m.source_if_ka_id),
-  pg_temp.norm_text(m.source_if_no_ka_id),
-  pg_temp.norm_text(m.kelp_location),
+  CASE WHEN lower(trim(coalesce(m.isolated_by,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.isolated_by) END,
+  CASE WHEN lower(trim(coalesce(m.maintained_by,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.maintained_by) END,
+  CASE WHEN lower(trim(coalesce(m.maintained_at,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.maintained_at) END,
 
-  pg_temp.norm_text(m.kelp_collection_temp),
-  pg_temp.safe_numeric(m.kelp_collection_temp),
-  pg_temp.norm_text(m.kelp_collection_month),
-  pg_temp.norm_text(m.kelp_collection_season),
-  pg_temp.norm_text(m.kelp_thallus_collection),
-  pg_temp.norm_text(m.kelp_collection_approach),
-  pg_temp.norm_text(m.kelp_collection_method),
+  CASE WHEN lower(trim(coalesce(m.kelp_host,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.kelp_host) END,
+  CASE WHEN lower(trim(coalesce(m.kelp_ka_sample_id,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.kelp_ka_sample_id) END,
+  CASE WHEN lower(trim(coalesce(m.source_if_ka_id,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.source_if_ka_id) END,
+  CASE WHEN lower(trim(coalesce(m.source_if_no_ka_id,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.source_if_no_ka_id) END,
+  CASE WHEN lower(trim(coalesce(m.kelp_location,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.kelp_location) END,
 
-  pg_temp.norm_text(m.microbe_isolation_methods),
-  pg_temp.norm_text(m.microbe_isolation_protocol),
-  pg_temp.norm_text(m.isolation_media),
+  CASE WHEN lower(trim(coalesce(m.kelp_collection_temp,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.kelp_collection_temp) END,
+  CASE
+    WHEN lower(trim(coalesce(m.kelp_collection_temp,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(m.kelp_collection_temp), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(m.kelp_collection_temp), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(m.kelp_collection_temp), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(m.kelp_collection_temp), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+  CASE WHEN lower(trim(coalesce(m.kelp_collection_month,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.kelp_collection_month) END,
+  CASE WHEN lower(trim(coalesce(m.kelp_collection_season,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.kelp_collection_season) END,
 
-  pg_temp.norm_text(m.location_stored1),
-  pg_temp.norm_text(m.location_1_temperature),
-  pg_temp.norm_text(m.location_stored2),
-  pg_temp.norm_text(m.location_2_temperature),
+  CASE WHEN lower(trim(coalesce(m.kelp_thallus_collection,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.kelp_thallus_collection) END,
+  CASE WHEN lower(trim(coalesce(m.kelp_collection_approach,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.kelp_collection_approach) END,
+  CASE WHEN lower(trim(coalesce(m.kelp_collection_method,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.kelp_collection_method) END,
 
-  pg_temp.norm_text(m.cryopreservation_date),
-  pg_temp.safe_date(m.cryopreservation_date),
-  pg_temp.norm_text(m.cryo_storage_medium),
-  pg_temp.norm_text(m.cryo_storage_preservative),
-  pg_temp.safe_bool(m.cryo_revival_tested),
-  pg_temp.safe_bool(m.cryo_backups_created),
-  pg_temp.norm_text(m.cryopreservation_protocol),
+  CASE WHEN lower(trim(coalesce(m.microbe_isolation_methods,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.microbe_isolation_methods) END,
+  CASE WHEN lower(trim(coalesce(m.microbe_isolation_protocol,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.microbe_isolation_protocol) END,
+  CASE WHEN lower(trim(coalesce(m.isolation_media,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.isolation_media) END,
 
-  pg_temp.safe_bool(m.malditof_procedure),
-  pg_temp.safe_bool(m.malditof_dataanalysis_complete),
-  pg_temp.norm_text(m.high_quality_malditof_data),
+  CASE WHEN lower(trim(coalesce(m.location_stored1,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.location_stored1) END,
+  CASE WHEN lower(trim(coalesce(m.location_1_temperature,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.location_1_temperature) END,
+  CASE WHEN lower(trim(coalesce(m.location_stored2,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.location_stored2) END,
+  CASE WHEN lower(trim(coalesce(m.location_2_temperature,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.location_2_temperature) END,
 
-  pg_temp.safe_bool(m.s16_pcr_completed),
-  pg_temp.norm_text(m.pcr_conducted_by),
-  pg_temp.safe_bool(m.sanger_sequencing_completed),
-  pg_temp.norm_text(m.sequencing_date),
-  pg_temp.safe_date(m.sequencing_date),
-  pg_temp.norm_text(m.primers_used),
-  pg_temp.norm_text(m.sequencing_notes),
-  pg_temp.norm_text(m.sequencing_conducted_by),
+  CASE WHEN lower(trim(coalesce(m.cryopreservation_date,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.cryopreservation_date) END,
+  CASE
+    WHEN lower(trim(coalesce(m.cryopreservation_date,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    WHEN trim(m.cryopreservation_date) ~ '^\d{1,2}-[A-Za-z]{3}-\d{2,4}$'
+      THEN to_date(trim(m.cryopreservation_date), CASE WHEN length(trim(m.cryopreservation_date)) = 9 THEN 'DD-Mon-YY' ELSE 'DD-Mon-YYYY' END)
+    WHEN trim(m.cryopreservation_date) ~ '^\d{1,2}/\d{1,2}/\d{4}$'
+      THEN to_date(trim(m.cryopreservation_date), 'MM/DD/YYYY')
+    ELSE NULL
+  END,
+  CASE WHEN lower(trim(coalesce(m.cryo_storage_medium,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.cryo_storage_medium) END,
+  CASE WHEN lower(trim(coalesce(m.cryo_storage_preservative,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.cryo_storage_preservative) END,
 
-  pg_temp.safe_int(m.total_bp_length_after_trimming),
-  pg_temp.norm_text(m.closest_ncbi_blast_tax_id),
-  pg_temp.safe_numeric(m.ncbi_blast_query_cover),
-  pg_temp.safe_numeric(m.percent_identity),
-  pg_temp.norm_text(m.accession),
-  pg_temp.norm_text(m.taxonomy_kingdom),
+  CASE WHEN lower(trim(coalesce(m.cryo_revival_tested,''))) IN ('yes','true','1') THEN true
+       WHEN lower(trim(coalesce(m.cryo_revival_tested,''))) IN ('no','false','0') THEN false
+       ELSE NULL END,
+  CASE WHEN lower(trim(coalesce(m.cryo_backups_created,''))) IN ('yes','true','1') THEN true
+       WHEN lower(trim(coalesce(m.cryo_backups_created,''))) IN ('no','false','0') THEN false
+       ELSE NULL END,
+  CASE WHEN lower(trim(coalesce(m.cryopreservation_protocol,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.cryopreservation_protocol) END,
 
-  pg_temp.norm_text(m.s16_sequence),
-  pg_temp.norm_text(m.its2_sequence),
+  CASE WHEN lower(trim(coalesce(m.malditof_procedure,''))) IN ('yes','true','1') THEN true
+       WHEN lower(trim(coalesce(m.malditof_procedure,''))) IN ('no','false','0') THEN false
+       ELSE NULL END,
+  CASE WHEN lower(trim(coalesce(m.malditof_dataanalysis_complete,''))) IN ('yes','true','1') THEN true
+       WHEN lower(trim(coalesce(m.malditof_dataanalysis_complete,''))) IN ('no','false','0') THEN false
+       ELSE NULL END,
+  CASE WHEN lower(trim(coalesce(m.high_quality_malditof_data,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.high_quality_malditof_data) END,
 
-  pg_temp.norm_text(m.pathogen_activity_kelp),
-  pg_temp.norm_text(m.pathogen_activity_humans),
-  pg_temp.norm_text(m.pathogen_activity_plants),
-  pg_temp.norm_text(m.pathogen_activity_animals),
+  CASE WHEN lower(trim(coalesce(m.s16_pcr_completed,''))) IN ('yes','true','1') THEN true
+       WHEN lower(trim(coalesce(m.s16_pcr_completed,''))) IN ('no','false','0') THEN false
+       ELSE NULL END,
+  CASE WHEN lower(trim(coalesce(m.pcr_conducted_by,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.pcr_conducted_by) END,
+  CASE WHEN lower(trim(coalesce(m.sanger_sequencing_completed,''))) IN ('yes','true','1') THEN true
+       WHEN lower(trim(coalesce(m.sanger_sequencing_completed,''))) IN ('no','false','0') THEN false
+       ELSE NULL END,
 
-  pg_temp.norm_text(m.growth_temperature_c_range),
-  pg_temp.norm_text(m.growth_salinity_range),
-  pg_temp.norm_text(m.growth_ph_range),
-  pg_temp.norm_text(m.growth_optimal_media),
+  CASE WHEN lower(trim(coalesce(m.sequencing_date,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.sequencing_date) END,
+  CASE
+    WHEN lower(trim(coalesce(m.sequencing_date,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    WHEN trim(m.sequencing_date) ~ '^\d{1,2}-[A-Za-z]{3}-\d{2,4}$'
+      THEN to_date(trim(m.sequencing_date), CASE WHEN length(trim(m.sequencing_date)) = 9 THEN 'DD-Mon-YY' ELSE 'DD-Mon-YYYY' END)
+    WHEN trim(m.sequencing_date) ~ '^\d{1,2}/\d{1,2}/\d{4}$'
+      THEN to_date(trim(m.sequencing_date), 'MM/DD/YYYY')
+    ELSE NULL
+  END,
 
-  pg_temp.norm_text(m.morphology_colony_color),
-  pg_temp.norm_text(m.morphology_colony_size),
-  pg_temp.norm_text(m.morphology_colony_shape),
-  pg_temp.norm_text(m.morphology_colony_texture),
-  pg_temp.norm_text(m.gram_stain),
-  pg_temp.norm_text(m.morphology_cell_shape),
+  CASE WHEN lower(trim(coalesce(m.primers_used,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.primers_used) END,
+  CASE WHEN lower(trim(coalesce(m.sequencing_notes,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.sequencing_notes) END,
+  CASE WHEN lower(trim(coalesce(m.sequencing_conducted_by,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.sequencing_conducted_by) END,
 
-  pg_temp.norm_text(m.probiotic_activity),
-  pg_temp.norm_text(m.probiotic_known_host)
+  CASE
+    WHEN lower(trim(coalesce(m.total_bp_length_after_trimming,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    WHEN trim(m.total_bp_length_after_trimming) ~ '^\d+$' THEN trim(m.total_bp_length_after_trimming)::int
+    ELSE NULL
+  END,
 
+  CASE WHEN lower(trim(coalesce(m.closest_ncbi_blast_tax_id,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.closest_ncbi_blast_tax_id) END,
+
+  CASE
+    WHEN lower(trim(coalesce(m.ncbi_blast_query_cover,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(m.ncbi_blast_query_cover), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(m.ncbi_blast_query_cover), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(m.ncbi_blast_query_cover), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(m.ncbi_blast_query_cover), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+
+  CASE
+    WHEN lower(trim(coalesce(m.percent_identity,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL
+    ELSE
+      CASE
+        WHEN NULLIF(regexp_replace(trim(m.percent_identity), '[^0-9\.\-]+', '', 'g'), '') IS NULL THEN NULL
+        WHEN regexp_replace(trim(m.percent_identity), '[^0-9\.\-]+', '', 'g') ~ '^\-?$' THEN NULL
+        WHEN regexp_replace(trim(m.percent_identity), '[^0-9\.\-]+', '', 'g') ~ '.*\-$' THEN NULL
+        ELSE NULLIF(regexp_replace(trim(m.percent_identity), '[^0-9\.\-]+', '', 'g'), '')::numeric
+      END
+  END,
+
+  CASE WHEN lower(trim(coalesce(m.accession,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.accession) END,
+  CASE WHEN lower(trim(coalesce(m.taxonomy_kingdom,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.taxonomy_kingdom) END,
+
+  CASE WHEN lower(trim(coalesce(m.s16_sequence,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.s16_sequence) END,
+  CASE WHEN lower(trim(coalesce(m.its2_sequence,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.its2_sequence) END,
+
+  CASE WHEN lower(trim(coalesce(m.pathogen_activity_kelp,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.pathogen_activity_kelp) END,
+  CASE WHEN lower(trim(coalesce(m.pathogen_activity_humans,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.pathogen_activity_humans) END,
+  CASE WHEN lower(trim(coalesce(m.pathogen_activity_plants,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.pathogen_activity_plants) END,
+  CASE WHEN lower(trim(coalesce(m.pathogen_activity_animals,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.pathogen_activity_animals) END,
+
+  CASE WHEN lower(trim(coalesce(m.growth_temperature_c_range,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.growth_temperature_c_range) END,
+  CASE WHEN lower(trim(coalesce(m.growth_salinity_range,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.growth_salinity_range) END,
+  CASE WHEN lower(trim(coalesce(m.growth_ph_range,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.growth_ph_range) END,
+  CASE WHEN lower(trim(coalesce(m.growth_optimal_media,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.growth_optimal_media) END,
+
+  CASE WHEN lower(trim(coalesce(m.morphology_colony_color,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.morphology_colony_color) END,
+  CASE WHEN lower(trim(coalesce(m.morphology_colony_size,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.morphology_colony_size) END,
+  CASE WHEN lower(trim(coalesce(m.morphology_colony_shape,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.morphology_colony_shape) END,
+  CASE WHEN lower(trim(coalesce(m.morphology_colony_texture,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.morphology_colony_texture) END,
+  CASE WHEN lower(trim(coalesce(m.gram_stain,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.gram_stain) END,
+  CASE WHEN lower(trim(coalesce(m.morphology_cell_shape,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.morphology_cell_shape) END,
+
+  CASE WHEN lower(trim(coalesce(m.probiotic_activity,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.probiotic_activity) END,
+  CASE WHEN lower(trim(coalesce(m.probiotic_known_host,''))) IN ('', 'na','n/a','none','null','not_yet_assessed','not yet assessed','tbd','to_be_analyzed') THEN NULL ELSE trim(m.probiotic_known_host) END
 FROM staging.microbes_raw m;
 
 CREATE INDEX IF NOT EXISTS idx_microbes_typed_batch ON staging.microbes_typed (ingest_batch_id);
@@ -633,28 +1125,3 @@ CREATE INDEX IF NOT EXISTS idx_microbes_typed_microbe_id ON staging.microbes_typ
 CREATE INDEX IF NOT EXISTS idx_microbes_typed_kelp_sample ON staging.microbes_typed (kelp_ka_sample_id);
 
 COMMIT;
-
--- ============================================================
--- Optional sanity checks (run after script)
--- ============================================================
--- SELECT
---   (SELECT count(*) FROM staging.kelps_raw)   AS kelps_raw_rows,
---   (SELECT count(*) FROM staging.kelps_typed) AS kelps_typed_rows,
---   (SELECT count(*) FROM staging.microbes_raw)   AS microbes_raw_rows,
---   (SELECT count(*) FROM staging.microbes_typed) AS microbes_typed_rows;
---
--- -- Confirm the bad Excel-ish value now parses numerically:
--- SELECT storage_details_temperature_c_raw,
---        storage_details_temperature_c_num,
---        count(*)
--- FROM staging.kelps_typed
--- GROUP BY 1,2
--- ORDER BY count(*) DESC;
---
--- -- Show raw values that did NOT parse to numeric (good for cleanup rules):
--- SELECT storage_details_temperature_c_raw, count(*)
--- FROM staging.kelps_typed
--- WHERE storage_details_temperature_c_raw IS NOT NULL
---   AND storage_details_temperature_c_num IS NULL
--- GROUP BY 1
--- ORDER BY count(*) DESC;
