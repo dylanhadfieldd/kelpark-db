@@ -5,125 +5,160 @@
 --
 -- Assumptions:
 --   - Raw tables exist: staging.kelps_raw, staging.microbes_raw
---   - Extension pgcrypto exists (for gen_random_uuid elsewhere)
+--   - staging.kelps_raw and staging.microbes_raw include ingest metadata cols:
+--       staging_id, ingest_batch_id, source_filename, source_row_num, loaded_at
 --
 -- Notes:
 --   - We DO NOT drop raw tables.
 --   - We cast conservatively (dates, numerics, booleans). Anything ambiguous stays TEXT.
---   - If your raw table has any auto-truncated column names (63 char limit), you MUST
---     edit the few long raw-column references in the kelps SELECT section to match
---     your actual staging.kelps_raw column names.
+--   - Numeric parsing is hardened to avoid errors like "12-" (returns NULL instead of failing).
+--   - Postgres identifiers > 63 chars are truncated; if your *_raw cols were truncated,
+--     adjust the SELECT aliases accordingly.
 
 BEGIN;
 
 CREATE SCHEMA IF NOT EXISTS staging;
 
 -- ============================================================
--- Helper functions (small + deterministic + reusable in SELECT)
+-- Helper functions (placeholders, numeric, boolean, date parse)
 -- ============================================================
--- Normalizes common placeholders to NULL and trims whitespace.
-CREATE OR REPLACE FUNCTION staging.nullify_placeholder(p_text TEXT)
-RETURNS TEXT
+
+-- Normalize common placeholders to NULL
+CREATE OR REPLACE FUNCTION staging.nullify_placeholder(p_text text)
+RETURNS text
 LANGUAGE sql
 IMMUTABLE
 AS $$
   SELECT CASE
     WHEN p_text IS NULL THEN NULL
+    WHEN btrim(p_text) = '' THEN NULL
     WHEN lower(btrim(p_text)) IN (
-      '', 'na','n/a','none','null',
+      'na','n/a','none','null',
       'not_yet_assessed','not yet assessed',
       'tbd','to_be_analyzed','to be analyzed'
     ) THEN NULL
     ELSE btrim(p_text)
-  END;
+  END
 $$;
 
--- Extract numeric best-effort (keeps digits, dot, minus). Returns NULL if nothing parseable.
-CREATE OR REPLACE FUNCTION staging.parse_numeric(p_text TEXT)
-RETURNS NUMERIC
-LANGUAGE sql
-IMMUTABLE
-AS $$
-  SELECT CASE
-    WHEN staging.nullify_placeholder(p_text) IS NULL THEN NULL
-    ELSE NULLIF(regexp_replace(staging.nullify_placeholder(p_text), '[^0-9\.\-]+', '', 'g'), '')::numeric
-  END;
-$$;
-
--- Parse integer (best-effort). Returns NULL if not clean integer.
-CREATE OR REPLACE FUNCTION staging.parse_int(p_text TEXT)
-RETURNS INTEGER
-LANGUAGE sql
-IMMUTABLE
-AS $$
-  SELECT CASE
-    WHEN staging.nullify_placeholder(p_text) IS NULL THEN NULL
-    WHEN staging.nullify_placeholder(p_text) ~ '^\-?\d+$' THEN staging.nullify_placeholder(p_text)::int
-    ELSE NULL
-  END;
-$$;
-
--- Parse boolean from yes/true/1 and no/false/0. Returns NULL otherwise.
-CREATE OR REPLACE FUNCTION staging.parse_bool(p_text TEXT)
-RETURNS BOOLEAN
-LANGUAGE sql
-IMMUTABLE
-AS $$
-  SELECT CASE
-    WHEN staging.nullify_placeholder(p_text) IS NULL THEN NULL
-    WHEN lower(staging.nullify_placeholder(p_text)) IN ('yes','true','1') THEN true
-    WHEN lower(staging.nullify_placeholder(p_text)) IN ('no','false','0') THEN false
-    ELSE NULL
-  END;
-$$;
-
--- Parse DATE from common formats:
---   - DD-Mon-YY / DD-Mon-YYYY  (e.g., 05-Jan-24 / 05-Jan-2024)
---   - MM/DD/YYYY              (e.g., 1/5/2024)
-CREATE OR REPLACE FUNCTION staging.parse_date(p_text TEXT)
-RETURNS DATE
+-- Hardened numeric parsing (prevents invalid casts like "12-")
+CREATE OR REPLACE FUNCTION staging.parse_numeric(p_text text)
+RETURNS numeric
 LANGUAGE plpgsql
 IMMUTABLE
 AS $$
 DECLARE
-  v TEXT;
+  s text;
 BEGIN
-  v := staging.nullify_placeholder(p_text);
-  IF v IS NULL THEN
+  s := staging.nullify_placeholder(p_text);
+  IF s IS NULL THEN
     RETURN NULL;
   END IF;
 
-  IF v ~ '^\d{1,2}-[A-Za-z]{3}-\d{2,4}$' THEN
-    IF length(v) = 9 THEN
-      RETURN to_date(v, 'DD-Mon-YY');
-    ELSE
-      RETURN to_date(v, 'DD-Mon-YYYY');
-    END IF;
-  ELSIF v ~ '^\d{1,2}/\d{1,2}/\d{4}$' THEN
-    RETURN to_date(v, 'MM/DD/YYYY');
-  ELSE
+  -- keep only digits, dot, minus
+  s := regexp_replace(trim(s), '[^0-9\.\-]+', '', 'g');
+  s := NULLIF(s, '');
+  IF s IS NULL THEN
     RETURN NULL;
   END IF;
+
+  -- reject common malformed remnants
+  IF s IN ('-', '.', '-.') THEN
+    RETURN NULL;
+  END IF;
+
+  -- only allow a single leading minus
+  IF s ~ '.*-.*-.*' OR (position('-' in s) > 1) THEN
+    RETURN NULL;
+  END IF;
+
+  -- reject trailing '-' or trailing '.'
+  IF s ~ '-$' OR s ~ '\.$' THEN
+    RETURN NULL;
+  END IF;
+
+  -- strict numeric pattern
+  IF s !~ '^\-?\d+(\.\d+)?$' THEN
+    RETURN NULL;
+  END IF;
+
+  RETURN s::numeric;
+
+EXCEPTION WHEN others THEN
+  RETURN NULL;
 END;
 $$;
 
--- Parse decimal degrees latitude/longitude ONLY if already decimal format (DMS stays NULL)
-CREATE OR REPLACE FUNCTION staging.parse_decimal_degrees(p_text TEXT)
-RETURNS NUMERIC
+-- Parse booleans from common yes/no strings; returns NULL if unknown/placeholder
+CREATE OR REPLACE FUNCTION staging.parse_bool(p_text text)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+AS $$
+  SELECT CASE
+    WHEN staging.nullify_placeholder(p_text) IS NULL THEN NULL
+    WHEN lower(staging.nullify_placeholder(p_text)) IN ('yes','true','1','y','t') THEN true
+    WHEN lower(staging.nullify_placeholder(p_text)) IN ('no','false','0','n','f') THEN false
+    ELSE NULL
+  END
+$$;
+
+-- Parse dates from a few common patterns; returns NULL if unknown/placeholder/unparseable
+CREATE OR REPLACE FUNCTION staging.parse_date(p_text text)
+RETURNS date
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+  s text;
+BEGIN
+  s := staging.nullify_placeholder(p_text);
+  IF s IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  -- DD-Mon-YY or DD-Mon-YYYY (e.g., 07-Jan-24, 07-Jan-2024)
+  IF s ~ '^\d{1,2}-[A-Za-z]{3}-\d{2,4}$' THEN
+    IF length(s) = 9 THEN
+      RETURN to_date(s, 'DD-Mon-YY');
+    ELSE
+      RETURN to_date(s, 'DD-Mon-YYYY');
+    END IF;
+  END IF;
+
+  -- MM/DD/YYYY
+  IF s ~ '^\d{1,2}/\d{1,2}/\d{4}$' THEN
+    RETURN to_date(s, 'MM/DD/YYYY');
+  END IF;
+
+  -- YYYY-MM-DD
+  IF s ~ '^\d{4}-\d{2}-\d{2}$' THEN
+    RETURN to_date(s, 'YYYY-MM-DD');
+  END IF;
+
+  RETURN NULL;
+EXCEPTION WHEN others THEN
+  RETURN NULL;
+END;
+$$;
+
+-- Parse lat/long decimal degrees only (DMS stays NULL for now)
+CREATE OR REPLACE FUNCTION staging.parse_decimal_degrees(p_text text)
+RETURNS numeric
 LANGUAGE sql
 IMMUTABLE
 AS $$
   SELECT CASE
     WHEN staging.nullify_placeholder(p_text) IS NULL THEN NULL
     WHEN staging.nullify_placeholder(p_text) ~ '^\s*-?\d+(\.\d+)?\s*$'
-      THEN staging.nullify_placeholder(p_text)::numeric
+      THEN btrim(staging.nullify_placeholder(p_text))::numeric
     ELSE NULL
-  END;
+  END
 $$;
 
--- =========================
--- Drop & recreate typed tables
--- =========================
+-- ==================================
+-- Drop & recreate typed staging tables
+-- ==================================
 DROP TABLE IF EXISTS staging.kelps_typed;
 DROP TABLE IF EXISTS staging.microbes_typed;
 
@@ -293,9 +328,13 @@ CREATE TABLE staging.kelps_typed (
 
 INSERT INTO staging.kelps_typed (
   staging_id, ingest_batch_id, source_filename, source_row_num, loaded_at,
+
   taxonomy_genus, taxonomy_species, taxonomy_sex, taxonomy_variety_or_form,
-  storage_details_id, storage_details_position_id, storage_details_rack_id, storage_details_location,
-  storage_details_temperature_c_raw, storage_details_temperature_c_num, storage_details_medium,
+
+  storage_details_id, storage_details_position_id, storage_details_rack_id,
+  storage_details_location, storage_details_temperature_c_raw,
+  storage_details_temperature_c_num, storage_details_medium,
+
   sampling_metadata_country, sampling_metadata_latitude_raw, sampling_metadata_longitude_raw,
   sampling_metadata_latitude_num, sampling_metadata_longitude_num,
   sampling_metadata_collection_date_raw, sampling_metadata_collection_date,
@@ -303,17 +342,22 @@ INSERT INTO staging.kelps_typed (
   sampling_metadata_isolation_date_raw, sampling_metadata_isolation_date,
   sampling_metadata_deposit_date_raw, sampling_metadata_deposit_date,
   sampling_metadata_deposited_by, sampling_metadata_permit, sampling_metadata_collection_site,
+
   other_previously_housed_location, sponsorship_strain_sponsorship_status, sponsorship_code,
+
   phenotypic_data_growth_rate_raw, phenotypic_data_growth_rate_num,
   phenotypic_data_optimal_growth_conditions,
   phenotypic_data_percent_viability_raw, phenotypic_data_percent_viability_num,
   phenotypic_data_lifespan,
   phenotypic_data_tolerance_to_thermal_stressor,
   phenotypic_data_tolerance_to_water_quality_stressors,
+
   inaturalist,
   ecological_role_primary_producer, ecological_role_carbon_sink, ecological_role_habitat_former,
+
   metabolic_pathways_kegg_pathway_id, metabolic_pathways_metacyc_pathway_id,
   functional_annotation_gene_function_id, functional_annotation_protein_function_id,
+
   genetic_variation_data_variant_id, genetic_variation_data_gene_id, genetic_variation_data_chromosome,
   genetic_variation_data_reference_allele, genetic_variation_data_alternate_allele,
   genetic_variation_data_variant_type,
@@ -321,40 +365,48 @@ INSERT INTO staging.kelps_typed (
   genetic_variation_data_read_depth_raw, genetic_variation_data_read_depth_num,
   genetic_variation_data_quality_score_raw, genetic_variation_data_quality_score_num,
   genetic_variation_data_genotype,
+
   genetic_diversity_fst_raw, genetic_diversity_fst_num,
   genetic_diversity_observed_heterozygosity_raw, genetic_diversity_observed_heterozygosity_num,
   genetic_diversity_observed_homozygosity_raw, genetic_diversity_observed_homozygosity_num,
   genetic_diversity_allele_count_raw, genetic_diversity_allele_count_num,
   genetic_diversity_nucleotide_diversity_raw, genetic_diversity_nucleotide_diversity_num,
+
   phenotypic_diversity_trait_id_name,
   phenotypic_diversity_trait_variance_raw, phenotypic_diversity_trait_variance_num,
   phenotypic_diversity_trait_mean_raw, phenotypic_diversity_trait_mean_num,
   phenotypic_diversity_trait_standard_deviation_raw, phenotypic_diversity_trait_standard_deviation_num,
   phenotypic_diversity_trait_range,
+
   iucn_red_list_extinct_ex, iucn_red_list_extinct_in_the_wild_ew,
   iucn_red_list_critically_endangered_cr, iucn_red_list_endangered_en,
   iucn_red_list_vulnerable_vu, iucn_red_list_least_concern,
   iucn_red_list_data_deficient_dd, iucn_red_list_not_evaluated_ne,
+
   ecosystem_endemic, ecosystem_naturalized, ecosystem_invasive, ecosystem_adventive,
   ecosystem_extirpated, ecosystem_weed, ecosystem_cultivated_horticultural,
   ecosystem_ruderal, ecosystem_pioneer,
+
   commercial_bio_variables_harvestable_yield_per_cycle_raw,
   commercial_bio_variables_harvestable_yield_per_cycle_num,
   commercial_bio_variables_harvest_season, commercial_bio_variables_light_needed,
   commercial_production_spoilage_rate_raw, commercial_production_spoilage_rate_num,
-  commercial_production_operational_cost_per_cycle_raw, commercial_production_operational_cost_per_cycle_num,
+  commercial_production_operational_cost_per_cycle_raw,
+  commercial_production_operational_cost_per_cycle_num,
   commercial_production_gross_margin_raw, commercial_production_gross_margin_num,
   commercial_market_price_volatility_index_raw, commercial_market_price_volatility_index_num,
   commercial_market_demand_index_sector,
   commercial_market_market_growth_rate_raw, commercial_market_market_growth_rate_num,
   commercial_processing_moisture_content_raw, commercial_processing_moisture_content_num,
   commercial_processing_protein_content_raw, commercial_processing_protein_content_num,
-  commercial_processing_alginate_or_carrageenan_content_raw, commercial_processing_alginate_or_carrageenan_content_num,
+  commercial_processing_alginate_or_carrageenan_content_raw,
+  commercial_processing_alginate_or_carrageenan_content_num,
   commercial_processing_contaminants, commercial_processing_shelf_life,
   commercial_processing_grade_quality_score_raw, commercial_processing_grade_quality_score_num,
   commercial_supply_logistics_transport_cost_raw, commercial_supply_logistics_transport_cost_num,
   commercial_supply_logistics_distribution_channel,
-  commercial_supply_logistics_carbon_footprint_transport_raw, commercial_supply_logistics_carbon_footprint_transport_num
+  commercial_supply_logistics_carbon_footprint_transport_raw,
+  commercial_supply_logistics_carbon_footprint_transport_num
 )
 SELECT
   k.staging_id,
@@ -372,22 +424,22 @@ SELECT
   staging.nullify_placeholder(k.storage_details_position_id),
   staging.nullify_placeholder(k.storage_details_rack_id),
   staging.nullify_placeholder(k.storage_details_location),
-  staging.nullify_placeholder(k.storage_details_temperature_c)                               AS storage_details_temperature_c_raw,
-  staging.parse_numeric(k.storage_details_temperature_c)                                     AS storage_details_temperature_c_num,
+  staging.nullify_placeholder(k.storage_details_temperature_c) AS storage_details_temperature_c_raw,
+  staging.parse_numeric(k.storage_details_temperature_c) AS storage_details_temperature_c_num,
   staging.nullify_placeholder(k.storage_details_medium),
 
   staging.nullify_placeholder(k.sampling_metadata_country),
-  staging.nullify_placeholder(k.sampling_metadata_latitude)                                  AS sampling_metadata_latitude_raw,
-  staging.nullify_placeholder(k.sampling_metadata_longitude)                                 AS sampling_metadata_longitude_raw,
-  staging.parse_decimal_degrees(k.sampling_metadata_latitude)                                AS sampling_metadata_latitude_num,
-  staging.parse_decimal_degrees(k.sampling_metadata_longitude)                               AS sampling_metadata_longitude_num,
-  staging.nullify_placeholder(k.sampling_metadata_collection_date)                           AS sampling_metadata_collection_date_raw,
-  staging.parse_date(k.sampling_metadata_collection_date)                                    AS sampling_metadata_collection_date,
+  staging.nullify_placeholder(k.sampling_metadata_latitude) AS sampling_metadata_latitude_raw,
+  staging.nullify_placeholder(k.sampling_metadata_longitude) AS sampling_metadata_longitude_raw,
+  staging.parse_decimal_degrees(k.sampling_metadata_latitude) AS sampling_metadata_latitude_num,
+  staging.parse_decimal_degrees(k.sampling_metadata_longitude) AS sampling_metadata_longitude_num,
+  staging.nullify_placeholder(k.sampling_metadata_collection_date) AS sampling_metadata_collection_date_raw,
+  staging.parse_date(k.sampling_metadata_collection_date) AS sampling_metadata_collection_date,
   staging.nullify_placeholder(k.sampling_metadata_personnel_collected),
-  staging.nullify_placeholder(k.sampling_metadata_isolation_date)                            AS sampling_metadata_isolation_date_raw,
-  staging.parse_date(k.sampling_metadata_isolation_date)                                     AS sampling_metadata_isolation_date,
-  staging.nullify_placeholder(k.sampling_metadata_deposit_date)                              AS sampling_metadata_deposit_date_raw,
-  staging.parse_date(k.sampling_metadata_deposit_date)                                       AS sampling_metadata_deposit_date,
+  staging.nullify_placeholder(k.sampling_metadata_isolation_date) AS sampling_metadata_isolation_date_raw,
+  staging.parse_date(k.sampling_metadata_isolation_date) AS sampling_metadata_isolation_date,
+  staging.nullify_placeholder(k.sampling_metadata_deposit_date) AS sampling_metadata_deposit_date_raw,
+  staging.parse_date(k.sampling_metadata_deposit_date) AS sampling_metadata_deposit_date,
   staging.nullify_placeholder(k.sampling_metadata_deposited_by),
   staging.nullify_placeholder(k.sampling_metadata_permit),
   staging.nullify_placeholder(k.sampling_metadata_collection_site),
@@ -396,17 +448,16 @@ SELECT
   staging.nullify_placeholder(k.sponsorship_strain_sponsorship_status),
   staging.nullify_placeholder(k.sponsorship_code),
 
-  staging.nullify_placeholder(k.phenotypic_data_growth_rate)                                 AS phenotypic_data_growth_rate_raw,
-  staging.parse_numeric(k.phenotypic_data_growth_rate)                                       AS phenotypic_data_growth_rate_num,
+  staging.nullify_placeholder(k.phenotypic_data_growth_rate) AS phenotypic_data_growth_rate_raw,
+  staging.parse_numeric(k.phenotypic_data_growth_rate) AS phenotypic_data_growth_rate_num,
   staging.nullify_placeholder(k.phenotypic_data_optimal_growth_conditions),
-  staging.nullify_placeholder(k.phenotypic_data_percent_viability)                           AS phenotypic_data_percent_viability_raw,
-  staging.parse_numeric(k.phenotypic_data_percent_viability)                                 AS phenotypic_data_percent_viability_num,
+  staging.nullify_placeholder(k.phenotypic_data_percent_viability) AS phenotypic_data_percent_viability_raw,
+  staging.parse_numeric(k.phenotypic_data_percent_viability) AS phenotypic_data_percent_viability_num,
   staging.nullify_placeholder(k.phenotypic_data_lifespan),
   staging.nullify_placeholder(k.phenotypic_data_tolerance_to_thermal_stressor),
   staging.nullify_placeholder(k.phenotypic_data_tolerance_to_water_quality_stressors),
 
   staging.nullify_placeholder(k.inaturalist),
-
   staging.nullify_placeholder(k.ecological_role_primary_producer),
   staging.nullify_placeholder(k.ecological_role_carbon_sink),
   staging.nullify_placeholder(k.ecological_role_habitat_former),
@@ -422,57 +473,36 @@ SELECT
   staging.nullify_placeholder(k.genetic_variation_data_reference_allele),
   staging.nullify_placeholder(k.genetic_variation_data_alternate_allele),
   staging.nullify_placeholder(k.genetic_variation_data_variant_type),
-  staging.nullify_placeholder(k.genetic_variation_data_allele_frequency)                      AS genetic_variation_data_allele_frequency_raw,
-  staging.parse_numeric(k.genetic_variation_data_allele_frequency)                            AS genetic_variation_data_allele_frequency_num,
-  staging.nullify_placeholder(k.genetic_variation_data_read_depth)                            AS genetic_variation_data_read_depth_raw,
-  staging.parse_numeric(k.genetic_variation_data_read_depth)                                  AS genetic_variation_data_read_depth_num,
-  staging.nullify_placeholder(k.genetic_variation_data_quality_score)                         AS genetic_variation_data_quality_score_raw,
-  staging.parse_numeric(k.genetic_variation_data_quality_score)                               AS genetic_variation_data_quality_score_num,
+  staging.nullify_placeholder(k.genetic_variation_data_allele_frequency) AS genetic_variation_data_allele_frequency_raw,
+  staging.parse_numeric(k.genetic_variation_data_allele_frequency) AS genetic_variation_data_allele_frequency_num,
+  staging.nullify_placeholder(k.genetic_variation_data_read_depth) AS genetic_variation_data_read_depth_raw,
+  staging.parse_numeric(k.genetic_variation_data_read_depth) AS genetic_variation_data_read_depth_num,
+  staging.nullify_placeholder(k.genetic_variation_data_quality_score) AS genetic_variation_data_quality_score_raw,
+  staging.parse_numeric(k.genetic_variation_data_quality_score) AS genetic_variation_data_quality_score_num,
   staging.nullify_placeholder(k.genetic_variation_data_genotype),
 
-  -- =========================
-  -- Diversity raw column names
-  -- =========================
-  -- IMPORTANT:
-  -- The next 4 groups are the ones most likely to differ in YOUR staging.kelps_raw
-  -- if Postgres truncated column names when you created the raw table.
-  -- If you get "column does not exist", edit these references to match \d staging.kelps_raw.
+  -- Diversity: if your raw columns were truncated by Postgres, update these names.
+  staging.nullify_placeholder(k.genetic_diversity_within_geography_sample_sets_fst) AS genetic_diversity_fst_raw,
+  staging.parse_numeric(k.genetic_diversity_within_geography_sample_sets_fst) AS genetic_diversity_fst_num,
+  staging.nullify_placeholder(k.genetic_diversity_within_geography_sample_sets_observed_heteroz) AS genetic_diversity_observed_heterozygosity_raw,
+  staging.parse_numeric(k.genetic_diversity_within_geography_sample_sets_observed_heteroz) AS genetic_diversity_observed_heterozygosity_num,
+  staging.nullify_placeholder(k.genetic_diversity_within_geography_sample_sets_observed_homozyg) AS genetic_diversity_observed_homozygosity_raw,
+  staging.parse_numeric(k.genetic_diversity_within_geography_sample_sets_observed_homozyg) AS genetic_diversity_observed_homozygosity_num,
+  staging.nullify_placeholder(k.genetic_diversity_within_geography_sample_sets_allele_count) AS genetic_diversity_allele_count_raw,
+  staging.parse_numeric(k.genetic_diversity_within_geography_sample_sets_allele_count) AS genetic_diversity_allele_count_num,
+  staging.nullify_placeholder(k.genetic_diversity_within_geography_sample_sets_nucleotide_diver) AS genetic_diversity_nucleotide_diversity_raw,
+  staging.parse_numeric(k.genetic_diversity_within_geography_sample_sets_nucleotide_diver) AS genetic_diversity_nucleotide_diversity_num,
 
-  staging.nullify_placeholder(k.genetic_diversity_within_geography_sample_sets_fst)           AS genetic_diversity_fst_raw,
-  staging.parse_numeric(k.genetic_diversity_within_geography_sample_sets_fst)                 AS genetic_diversity_fst_num,
-
-  staging.nullify_placeholder(k.genetic_diversity_within_geography_sample_sets_observed_heteroz)
-                                                                                              AS genetic_diversity_observed_heterozygosity_raw,
-  staging.parse_numeric(k.genetic_diversity_within_geography_sample_sets_observed_heteroz)
-                                                                                              AS genetic_diversity_observed_heterozygosity_num,
-
-  staging.nullify_placeholder(k.genetic_diversity_within_geography_sample_sets_observed_homozyg)
-                                                                                              AS genetic_diversity_observed_homozygosity_raw,
-  staging.parse_numeric(k.genetic_diversity_within_geography_sample_sets_observed_homozyg)
-                                                                                              AS genetic_diversity_observed_homozygosity_num,
-
-  staging.nullify_placeholder(k.genetic_diversity_within_geography_sample_sets_allele_count)  AS genetic_diversity_allele_count_raw,
-  staging.parse_numeric(k.genetic_diversity_within_geography_sample_sets_allele_count)        AS genetic_diversity_allele_count_num,
-
-  staging.nullify_placeholder(k.genetic_diversity_within_geography_sample_sets_nucleotide_diver)
-                                                                                              AS genetic_diversity_nucleotide_diversity_raw,
-  staging.parse_numeric(k.genetic_diversity_within_geography_sample_sets_nucleotide_diver)
-                                                                                              AS genetic_diversity_nucleotide_diversity_num,
-
-  staging.nullify_placeholder(k.phenotypic_diversity_within_geography_sample_sets_trait_id_name)
-                                                                                              AS phenotypic_diversity_trait_id_name,
-  staging.nullify_placeholder(k.phenotypic_diversity_within_geography_sample_sets_trait_varianc)
-                                                                                              AS phenotypic_diversity_trait_variance_raw,
-  staging.parse_numeric(k.phenotypic_diversity_within_geography_sample_sets_trait_varianc)
-                                                                                              AS phenotypic_diversity_trait_variance_num,
-  staging.nullify_placeholder(k.phenotypic_diversity_within_geography_sample_sets_trait_mean)  AS phenotypic_diversity_trait_mean_raw,
-  staging.parse_numeric(k.phenotypic_diversity_within_geography_sample_sets_trait_mean)        AS phenotypic_diversity_trait_mean_num,
-  staging.nullify_placeholder(k.phenotypic_diversity_within_geography_sample_sets_trait_standar)
-                                                                                              AS phenotypic_diversity_trait_standard_deviation_raw,
-  staging.parse_numeric(k.phenotypic_diversity_within_geography_sample_sets_trait_standar)
-                                                                                              AS phenotypic_diversity_trait_standard_deviation_num,
+  staging.nullify_placeholder(k.phenotypic_diversity_within_geography_sample_sets_trait_id_name) AS phenotypic_diversity_trait_id_name,
+  staging.nullify_placeholder(k.phenotypic_diversity_within_geography_sample_sets_trait_varianc) AS phenotypic_diversity_trait_variance_raw,
+  staging.parse_numeric(k.phenotypic_diversity_within_geography_sample_sets_trait_varianc) AS phenotypic_diversity_trait_variance_num,
+  staging.nullify_placeholder(k.phenotypic_diversity_within_geography_sample_sets_trait_mean) AS phenotypic_diversity_trait_mean_raw,
+  staging.parse_numeric(k.phenotypic_diversity_within_geography_sample_sets_trait_mean) AS phenotypic_diversity_trait_mean_num,
+  staging.nullify_placeholder(k.phenotypic_diversity_within_geography_sample_sets_trait_standar) AS phenotypic_diversity_trait_standard_deviation_raw,
+  staging.parse_numeric(k.phenotypic_diversity_within_geography_sample_sets_trait_standar) AS phenotypic_diversity_trait_standard_deviation_num,
   staging.nullify_placeholder(k.phenotypic_diversity_within_geography_sample_sets_trait_range) AS phenotypic_diversity_trait_range,
 
+  -- IUCN flags
   staging.parse_bool(k.iucn_red_list_extinct_ex),
   staging.parse_bool(k.iucn_red_list_extinct_in_the_wild_ew),
   staging.parse_bool(k.iucn_red_list_critically_endangered_cr),
@@ -482,6 +512,7 @@ SELECT
   staging.parse_bool(k.iucn_red_list_data_deficient_dd),
   staging.parse_bool(k.iucn_red_list_not_evaluated_ne),
 
+  -- Ecosystem flags
   staging.parse_bool(k.ecosystem_endemic),
   staging.parse_bool(k.ecosystem_naturalized),
   staging.parse_bool(k.ecosystem_invasive),
@@ -492,43 +523,41 @@ SELECT
   staging.parse_bool(k.ecosystem_ruderal),
   staging.parse_bool(k.ecosystem_pioneer),
 
-  staging.nullify_placeholder(k.commercial_bio_variables_harvestable_yield_per_cycle)         AS commercial_bio_variables_harvestable_yield_per_cycle_raw,
-  staging.parse_numeric(k.commercial_bio_variables_harvestable_yield_per_cycle)               AS commercial_bio_variables_harvestable_yield_per_cycle_num,
+  -- Commercial
+  staging.nullify_placeholder(k.commercial_bio_variables_harvestable_yield_per_cycle) AS commercial_bio_variables_harvestable_yield_per_cycle_raw,
+  staging.parse_numeric(k.commercial_bio_variables_harvestable_yield_per_cycle) AS commercial_bio_variables_harvestable_yield_per_cycle_num,
   staging.nullify_placeholder(k.commercial_bio_variables_harvest_season),
   staging.nullify_placeholder(k.commercial_bio_variables_light_needed),
 
-  staging.nullify_placeholder(k.commercial_production_spoilage_rate)                          AS commercial_production_spoilage_rate_raw,
-  staging.parse_numeric(k.commercial_production_spoilage_rate)                                AS commercial_production_spoilage_rate_num,
-  staging.nullify_placeholder(k.commercial_production_operational_cost_per_cycle)             AS commercial_production_operational_cost_per_cycle_raw,
-  staging.parse_numeric(k.commercial_production_operational_cost_per_cycle)                   AS commercial_production_operational_cost_per_cycle_num,
-  staging.nullify_placeholder(k.commercial_production_gross_margin)                           AS commercial_production_gross_margin_raw,
-  staging.parse_numeric(k.commercial_production_gross_margin)                                 AS commercial_production_gross_margin_num,
+  staging.nullify_placeholder(k.commercial_production_spoilage_rate) AS commercial_production_spoilage_rate_raw,
+  staging.parse_numeric(k.commercial_production_spoilage_rate) AS commercial_production_spoilage_rate_num,
+  staging.nullify_placeholder(k.commercial_production_operational_cost_per_cycle) AS commercial_production_operational_cost_per_cycle_raw,
+  staging.parse_numeric(k.commercial_production_operational_cost_per_cycle) AS commercial_production_operational_cost_per_cycle_num,
+  staging.nullify_placeholder(k.commercial_production_gross_margin) AS commercial_production_gross_margin_raw,
+  staging.parse_numeric(k.commercial_production_gross_margin) AS commercial_production_gross_margin_num,
 
-  staging.nullify_placeholder(k.commercial_market_price_volatility_index)                     AS commercial_market_price_volatility_index_raw,
-  staging.parse_numeric(k.commercial_market_price_volatility_index)                           AS commercial_market_price_volatility_index_num,
+  staging.nullify_placeholder(k.commercial_market_price_volatility_index) AS commercial_market_price_volatility_index_raw,
+  staging.parse_numeric(k.commercial_market_price_volatility_index) AS commercial_market_price_volatility_index_num,
   staging.nullify_placeholder(k.commercial_market_demand_index_sector),
-  staging.nullify_placeholder(k.commercial_market_market_growth_rate)                         AS commercial_market_market_growth_rate_raw,
-  staging.parse_numeric(k.commercial_market_market_growth_rate)                               AS commercial_market_market_growth_rate_num,
+  staging.nullify_placeholder(k.commercial_market_market_growth_rate) AS commercial_market_market_growth_rate_raw,
+  staging.parse_numeric(k.commercial_market_market_growth_rate) AS commercial_market_market_growth_rate_num,
 
-  staging.nullify_placeholder(k.commercial_processing_moisture_content)                       AS commercial_processing_moisture_content_raw,
-  staging.parse_numeric(k.commercial_processing_moisture_content)                             AS commercial_processing_moisture_content_num,
-  staging.nullify_placeholder(k.commercial_processing_protein_content)                        AS commercial_processing_protein_content_raw,
-  staging.parse_numeric(k.commercial_processing_protein_content)                              AS commercial_processing_protein_content_num,
-  staging.nullify_placeholder(k.commercial_processing_alginate_or_carrageenan_content)        AS commercial_processing_alginate_or_carrageenan_content_raw,
-  staging.parse_numeric(k.commercial_processing_alginate_or_carrageenan_content)              AS commercial_processing_alginate_or_carrageenan_content_num,
-
+  staging.nullify_placeholder(k.commercial_processing_moisture_content) AS commercial_processing_moisture_content_raw,
+  staging.parse_numeric(k.commercial_processing_moisture_content) AS commercial_processing_moisture_content_num,
+  staging.nullify_placeholder(k.commercial_processing_protein_content) AS commercial_processing_protein_content_raw,
+  staging.parse_numeric(k.commercial_processing_protein_content) AS commercial_processing_protein_content_num,
+  staging.nullify_placeholder(k.commercial_processing_alginate_or_carrageenan_content) AS commercial_processing_alginate_or_carrageenan_content_raw,
+  staging.parse_numeric(k.commercial_processing_alginate_or_carrageenan_content) AS commercial_processing_alginate_or_carrageenan_content_num,
   staging.nullify_placeholder(k.commercial_processing_contaminants),
   staging.nullify_placeholder(k.commercial_processing_shelf_life),
+  staging.nullify_placeholder(k.commercial_processing_grade_quality_score) AS commercial_processing_grade_quality_score_raw,
+  staging.parse_numeric(k.commercial_processing_grade_quality_score) AS commercial_processing_grade_quality_score_num,
 
-  staging.nullify_placeholder(k.commercial_processing_grade_quality_score)                    AS commercial_processing_grade_quality_score_raw,
-  staging.parse_numeric(k.commercial_processing_grade_quality_score)                          AS commercial_processing_grade_quality_score_num,
-
-  staging.nullify_placeholder(k.commercial_supply_logistics_transport_cost)                   AS commercial_supply_logistics_transport_cost_raw,
-  staging.parse_numeric(k.commercial_supply_logistics_transport_cost)                         AS commercial_supply_logistics_transport_cost_num,
+  staging.nullify_placeholder(k.commercial_supply_logistics_transport_cost) AS commercial_supply_logistics_transport_cost_raw,
+  staging.parse_numeric(k.commercial_supply_logistics_transport_cost) AS commercial_supply_logistics_transport_cost_num,
   staging.nullify_placeholder(k.commercial_supply_logistics_distribution_channel),
-
-  staging.nullify_placeholder(k.commercial_supply_logistics_carbon_footprint_transport)       AS commercial_supply_logistics_carbon_footprint_transport_raw,
-  staging.parse_numeric(k.commercial_supply_logistics_carbon_footprint_transport)             AS commercial_supply_logistics_carbon_footprint_transport_num
+  staging.nullify_placeholder(k.commercial_supply_logistics_carbon_footprint_transport) AS commercial_supply_logistics_carbon_footprint_transport_raw,
+  staging.parse_numeric(k.commercial_supply_logistics_carbon_footprint_transport) AS commercial_supply_logistics_carbon_footprint_transport_num
 FROM staging.kelps_raw k;
 
 CREATE INDEX IF NOT EXISTS idx_kelps_typed_batch ON staging.kelps_typed (ingest_batch_id);
@@ -657,8 +686,11 @@ SELECT
   staging.nullify_placeholder(m.original_code),
   staging.nullify_placeholder(m.institution_isolation_physically_conducted),
 
-  -- FIXED: isolated_year parsing (your previous version mixed casts and would error)
-  staging.parse_int(m.isolated_year),
+  CASE
+    WHEN staging.nullify_placeholder(m.isolated_year) IS NULL THEN NULL
+    WHEN staging.nullify_placeholder(m.isolated_year) ~ '^\d{4}$' THEN staging.nullify_placeholder(m.isolated_year)::int
+    ELSE NULL
+  END,
 
   staging.nullify_placeholder(m.isolated_by),
   staging.nullify_placeholder(m.maintained_by),
@@ -671,7 +703,7 @@ SELECT
   staging.nullify_placeholder(m.kelp_location),
 
   staging.nullify_placeholder(m.kelp_collection_temp) AS kelp_collection_temp_raw,
-  staging.parse_numeric(m.kelp_collection_temp)       AS kelp_collection_temp_num,
+  staging.parse_numeric(m.kelp_collection_temp) AS kelp_collection_temp_num,
   staging.nullify_placeholder(m.kelp_collection_month),
   staging.nullify_placeholder(m.kelp_collection_season),
 
@@ -689,7 +721,7 @@ SELECT
   staging.nullify_placeholder(m.location_2_temperature),
 
   staging.nullify_placeholder(m.cryopreservation_date) AS cryopreservation_date_raw,
-  staging.parse_date(m.cryopreservation_date)          AS cryopreservation_date,
+  staging.parse_date(m.cryopreservation_date) AS cryopreservation_date,
   staging.nullify_placeholder(m.cryo_storage_medium),
   staging.nullify_placeholder(m.cryo_storage_preservative),
   staging.parse_bool(m.cryo_revival_tested),
@@ -704,13 +736,17 @@ SELECT
   staging.nullify_placeholder(m.pcr_conducted_by),
   staging.parse_bool(m.sanger_sequencing_completed),
   staging.nullify_placeholder(m.sequencing_date) AS sequencing_date_raw,
-  staging.parse_date(m.sequencing_date)          AS sequencing_date,
+  staging.parse_date(m.sequencing_date) AS sequencing_date,
   staging.nullify_placeholder(m.primers_used),
   staging.nullify_placeholder(m.sequencing_notes),
   staging.nullify_placeholder(m.sequencing_conducted_by),
 
-  staging.parse_int(m.total_bp_length_after_trimming),
-
+  CASE
+    WHEN staging.nullify_placeholder(m.total_bp_length_after_trimming) IS NULL THEN NULL
+    WHEN staging.nullify_placeholder(m.total_bp_length_after_trimming) ~ '^\d+$'
+      THEN staging.nullify_placeholder(m.total_bp_length_after_trimming)::int
+    ELSE NULL
+  END,
   staging.nullify_placeholder(m.closest_ncbi_blast_tax_id),
   staging.parse_numeric(m.ncbi_blast_query_cover),
   staging.parse_numeric(m.percent_identity),
@@ -745,9 +781,7 @@ CREATE INDEX IF NOT EXISTS idx_microbes_typed_batch ON staging.microbes_typed (i
 CREATE INDEX IF NOT EXISTS idx_microbes_typed_microbe_id ON staging.microbes_typed (microbe_id);
 CREATE INDEX IF NOT EXISTS idx_microbes_typed_kelp_sample ON staging.microbes_typed (kelp_ka_sample_id);
 
--- =========================
--- Quick sanity checks
--- =========================
+-- Quick sanity checks (optional)
 -- SELECT count(*) FROM staging.kelps_typed;
 -- SELECT count(*) FROM staging.microbes_typed;
 
