@@ -3,7 +3,7 @@
 BEGIN;
 
 -- ============================================================
--- 007_structured_location_dim_nospatial.sql
+-- 006_structured_location_dim_nospatial.sql
 -- PostGIS-free location dimension
 -- Coordinates remain map-ready via lat/lon
 -- ============================================================
